@@ -1,0 +1,25 @@
+[Unit]
+Description=ESG query extraction model (Qwen3-8B, CUDA)
+After=network.target
+
+[Service]
+Type=simple
+User=akhi93m6
+Environment=LD_LIBRARY_PATH=/mnt/ii_models/tmp/llama_run/build-cuda/bin:/mnt/ii_models/Users/hizhenkov/ESG/runtime/cuda13
+ExecStart=/mnt/ii_models/tmp/llama_run/build-cuda/bin/llama-server \
+  -m /mnt/ii_models/tmp/llama/Qwen3-8B-Q5_K_M.gguf \
+  --alias esg-query-extractor \
+  --host 0.0.0.0 \
+  --port 1236 \
+  --ctx-size 4096 \
+  --parallel 2 \
+  --threads 8 \
+  --n-gpu-layers all \
+  --fit off \
+  --no-webui
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

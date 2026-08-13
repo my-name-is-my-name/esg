@@ -1,0 +1,57 @@
+services:
+  esg-api:
+    build: .
+    environment:
+      ESG_QDRANT_URL: http://qdrant:6333
+      ESG_QDRANT_COLLECTION: ${ESG_QDRANT_COLLECTION:-esg_document_chunks}
+      ESG_OLLAMA_URL: http://ollama:11434
+      ESG_INPUT_DIR: /app/input_documents
+      ESG_ARCHIVE_INPUT_DIR: /app/archive_documents
+      ESG_INPUT_EXTENSIONS: ${ESG_INPUT_EXTENSIONS:-.docx}
+      ESG_INPUT_FILENAME_TOKENS: ${ESG_INPUT_FILENAME_TOKENS:-TR,SR}
+      ESG_SEARCH_FILENAME_TOKENS: ${ESG_SEARCH_FILENAME_TOKENS:-TR,SR}
+      ESG_MARKDOWN_DIR: /app/source_documents
+      ESG_SOURCE_LINK_ROOT: ${ESG_SOURCE_LINK_ROOT:-}
+      ESG_SOURCE_LINK_ROOTS: ${ESG_SOURCE_LINK_ROOTS:-{}}
+      ESG_RUNTIME_DIR: /app/runtime
+      ESG_MODEL_ID: ${ESG_MODEL_ID:-esg-repair-search}
+      ESG_EMBEDDING_MODEL: ${ESG_EMBEDDING_MODEL:-bge-m3}
+      ESG_EMBEDDING_BATCH_SIZE: ${ESG_EMBEDDING_BATCH_SIZE:-16}
+      ESG_LLM_BASE_URL: ${ESG_LLM_BASE_URL:-http://10.100.112.71:1234/v1}
+      ESG_LLM_API_KEY: ${ESG_LLM_API_KEY:-local}
+      ESG_LLM_MODEL: ${ESG_LLM_MODEL:-}
+      ESG_LLM_TIMEOUT_SECONDS: ${ESG_LLM_TIMEOUT_SECONDS:-120}
+      ESG_LLM_MAX_TOKENS: ${ESG_LLM_MAX_TOKENS:-4000}
+      ESG_QUERY_EXTRACTION_ENABLED: ${ESG_QUERY_EXTRACTION_ENABLED:-false}
+      ESG_QUERY_LLM_BASE_URL: ${ESG_QUERY_LLM_BASE_URL:-}
+      ESG_QUERY_LLM_MODEL: ${ESG_QUERY_LLM_MODEL:-esg-query-extractor}
+      ESG_QUERY_LLM_TIMEOUT_SECONDS: ${ESG_QUERY_LLM_TIMEOUT_SECONDS:-15}
+      ESG_CHUNK_EXTRACTION_ENABLED: ${ESG_CHUNK_EXTRACTION_ENABLED:-false}
+      ESG_CHUNK_EXTRACTION_MAX_CHARS: ${ESG_CHUNK_EXTRACTION_MAX_CHARS:-5000}
+      ESG_CHUNK_EXTRACTION_WORKERS: ${ESG_CHUNK_EXTRACTION_WORKERS:-2}
+      ESG_RERANKER_URL: ${ESG_RERANKER_URL:-http://reranker-gpu:9101}
+      ESG_RERANKER_TIMEOUT_SECONDS: ${ESG_RERANKER_TIMEOUT_SECONDS:-60}
+      ESG_RERANKER_BATCH_SIZE: ${ESG_RERANKER_BATCH_SIZE:-8}
+      ESG_RETRIEVAL_TOP_K: ${ESG_RETRIEVAL_TOP_K:-40}
+      ESG_FINAL_TOP_K: ${ESG_FINAL_TOP_K:-6}
+      ESG_RRF_K: ${ESG_RRF_K:-60}
+      MINERU_BACKEND: ${MINERU_BACKEND:-pipeline}
+      MINERU_METHOD: ${MINERU_METHOD:-txt}
+      MINERU_LANG: ${MINERU_LANG:-cyrillic}
+      MINERU_TIMEOUT_SECONDS: ${MINERU_TIMEOUT_SECONDS:-1800}
+      ESG_DIRECT_DOCX_ENABLED: ${ESG_DIRECT_DOCX_ENABLED:-true}
+    ports:
+      - "8132:8132"
+    volumes:
+      - ${ESG_INPUT_DIR:-./input_documents}:/app/input_documents:ro
+      - ${ESG_ARCHIVE_INPUT_DIR:-./input_documents}:/app/archive_documents:ro
+      - ./source_documents:/app/source_documents
+      - ./runtime:/app/runtime
+    networks:
+      - intranet_rag
+    restart: unless-stopped
+
+networks:
+  intranet_rag:
+    external: true
+    name: intranet-rag_default
