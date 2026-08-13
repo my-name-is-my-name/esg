@@ -102,6 +102,7 @@ class Settings:
     reranker_batch_size: int = int(os.getenv("ESG_RERANKER_BATCH_SIZE", "8"))
     retrieval_top_k: int = int(os.getenv("ESG_RETRIEVAL_TOP_K", "40"))
     final_top_k: int = int(os.getenv("ESG_FINAL_TOP_K", "6"))
+    show_retrieved_chunks: bool = _bool("ESG_SHOW_RETRIEVED_CHUNKS", False)
     rrf_k: int = int(os.getenv("ESG_RRF_K", "60"))
 
     mineru_backend: str = os.getenv("MINERU_BACKEND", "pipeline")

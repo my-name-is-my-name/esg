@@ -163,6 +163,7 @@ def handler_for(app: Application) -> type[BaseHTTPRequestHandler]:
                     list(result.get("sources") or []),
                     app.settings.source_link_root,
                     app.settings.source_link_roots,
+                    app.settings.show_retrieved_chunks,
                 )
                 chunk = {
                     "id": completion_id,
@@ -182,6 +183,7 @@ def handler_for(app: Application) -> type[BaseHTTPRequestHandler]:
                 list(result.get("sources") or []),
                 app.settings.source_link_root,
                 app.settings.source_link_roots,
+                app.settings.show_retrieved_chunks,
             )
             reasoning = "\n".join(str(item) for item in result.get("reasoning", []) if str(item).strip())
             response = {
@@ -234,8 +236,9 @@ def append_sources(
     sources: list[dict[str, object]],
     source_link_root: str = "",
     source_link_roots: tuple[tuple[str, str], ...] = (),
+    show_on_negative: bool = False,
 ) -> str:
-    if not sources or answer.strip() == NEGATIVE_ANSWER:
+    if not sources or (answer.strip() == NEGATIVE_ANSWER and not show_on_negative):
         return answer
     lines = [
         answer.rstrip(),

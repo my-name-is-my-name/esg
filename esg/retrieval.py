@@ -165,7 +165,9 @@ class RetrievalService:
         sources = [source_from_record(row) for row in candidates]
         note("Формирую ответ только по подтверждающим фрагментам документов.")
         answer, supporting, found = self._answer(question, query, sources, warnings)
-        if not found:
+        if self.settings.show_retrieved_chunks:
+            note(f"Тестовый режим: показываю отобранные retrieval-чанки: {len(sources)}.")
+        elif not found:
             sources = []
         elif supporting:
             selected_sources = [sources[index - 1] for index in supporting if 1 <= index <= len(sources)]

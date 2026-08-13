@@ -94,6 +94,19 @@ class ApiContractTests(unittest.TestCase):
 
         self.assertEqual(append_sources(answer, [source]), answer)
 
+    def test_debug_mode_renders_sources_for_negative_answer(self) -> None:
+        answer = "В проиндексированных документах подтверждающий ремонт не найден."
+        source = {
+            "source_path": "folder/report.docx",
+            "section_heading": "Описание ремонта",
+            "evidence_text": "Кандидат retrieval.",
+        }
+
+        rendered = append_sources(answer, [source], show_on_negative=True)
+
+        self.assertIn("Источники:", rendered)
+        self.assertIn("Кандидат retrieval.", rendered)
+
     def test_source_table_is_deduplicated_and_escaped(self) -> None:
         source = {
             "source_path": "folder/report|A.pdf",
