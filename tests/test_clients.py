@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from unittest import mock
 
-from esg.clients import ExternalReranker, OpenAIClient, SemanticExtractor
+from esg.clients import EmbeddingClient, ExternalReranker, OpenAIClient, SemanticExtractor
 
 
 class Response:
@@ -20,6 +20,26 @@ class Response:
 
 
 class OpenAIClientTests(unittest.TestCase):
+    def test_embeddings_support_openai_compatible_endpoint(self) -> None:
+        settings = mock.Mock(
+            ollama_url="http://embeddings/v1",
+            embedding_api="openai",
+            embedding_model="bge-m3",
+            embedding_batch_size=16,
+        )
+        response = Response(200, {
+            "data": [
+                {"index": 1, "embedding": [0.3, 0.4]},
+                {"index": 0, "embedding": [0.1, 0.2]},
+            ]
+        })
+        with mock.patch("esg.clients.requests.post", return_value=response) as post:
+            vectors = EmbeddingClient(settings).embed(["one", "two"])
+
+        self.assertEqual(vectors, [[0.1, 0.2], [0.3, 0.4]])
+        self.assertEqual(post.call_args.args[0], "http://embeddings/v1/embeddings")
+        self.assertEqual(post.call_args.kwargs["json"], {"model": "bge-m3", "input": ["one", "two"]})
+
     def test_json_mode_retries_without_response_format_on_400(self) -> None:
         settings = mock.Mock(
             llm_base_url="http://llm/v1",

@@ -1,0 +1,13 @@
+[Unit]
+Description=ESG bge-m3 GPU embedding server
+After=network-online.target
+
+[Service]
+Type=simple
+Environment=LD_LIBRARY_PATH=/mnt/ii_models/tmp/llama_run/build-cuda/bin:/mnt/ii_models/Users/hizhenkov/ESG/runtime/cuda13
+ExecStart=/mnt/ii_models/tmp/llama_run/build-cuda/bin/llama-server -m /home/akhi93m6/esg-models/bge-m3.gguf --alias bge-m3 --host 0.0.0.0 --port 1237 --ctx-size 8192 --batch-size 8192 --ubatch-size 8192 --threads 8 --n-gpu-layers all --embedding --no-webui
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

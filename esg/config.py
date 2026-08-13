@@ -80,6 +80,7 @@ class Settings:
     qdrant_url: str = os.getenv("ESG_QDRANT_URL", "http://127.0.0.1:6333")
     qdrant_collection: str = os.getenv("ESG_QDRANT_COLLECTION", "esg_document_chunks")
     ollama_url: str = os.getenv("ESG_OLLAMA_URL", "http://127.0.0.1:11434")
+    embedding_api: str = os.getenv("ESG_EMBEDDING_API", "ollama").strip().casefold()
     embedding_model: str = os.getenv("ESG_EMBEDDING_MODEL", "bge-m3")
     embedding_batch_size: int = int(os.getenv("ESG_EMBEDDING_BATCH_SIZE", "16"))
 

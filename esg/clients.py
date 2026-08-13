@@ -156,6 +156,18 @@ class EmbeddingClient:
 
     def _embed_batch(self, texts: list[str]) -> list[list[float]]:
         base = self.settings.ollama_url.rstrip("/")
+        if getattr(self.settings, "embedding_api", "ollama") == "openai":
+            response = requests.post(
+                f"{base}/embeddings",
+                json={"model": self.settings.embedding_model, "input": texts},
+                timeout=180,
+            )
+            response.raise_for_status()
+            data = response.json().get("data") or []
+            if len(data) != len(texts):
+                raise RuntimeError("OpenAI-compatible endpoint returned an unexpected number of embeddings")
+            ordered = sorted(data, key=lambda item: int(item.get("index", 0)))
+            return [[float(value) for value in item["embedding"]] for item in ordered]
         response = requests.post(
             f"{base}/api/embed",
             json={"model": self.settings.embedding_model, "input": texts},

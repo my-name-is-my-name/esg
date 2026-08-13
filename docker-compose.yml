@@ -4,7 +4,8 @@ services:
     environment:
       ESG_QDRANT_URL: http://qdrant:6333
       ESG_QDRANT_COLLECTION: ${ESG_QDRANT_COLLECTION:-esg_document_chunks}
-      ESG_OLLAMA_URL: http://ollama:11434
+      ESG_OLLAMA_URL: ${ESG_OLLAMA_URL:-http://ollama:11434}
+      ESG_EMBEDDING_API: ${ESG_EMBEDDING_API:-ollama}
       ESG_INPUT_DIR: /app/input_documents
       ESG_ARCHIVE_INPUT_DIR: /app/archive_documents
       ESG_INPUT_EXTENSIONS: ${ESG_INPUT_EXTENSIONS:-.docx}
