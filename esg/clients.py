@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable
 from typing import Any
 
 import requests
 
 from esg.config import Settings
-from esg.models import QueryExtraction, Zone, ZoneElement
+from esg.models import DocumentRepairExtraction, QueryExtraction, Repair, Zone, ZoneElement
 
 
 class OpenAIClient:
@@ -37,6 +38,59 @@ class OpenAIClient:
     def json_completion(self, system: str, user: str) -> dict[str, Any]:
         content = self.completion(system, user, response_format={"type": "json_object"})
         return _json_object(content)
+
+    def json_completion_stream(
+        self,
+        system: str,
+        user: str,
+        on_reasoning: Callable[[str], None],
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "model": self.model(),
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            "temperature": 0,
+            "max_tokens": self.settings.llm_max_tokens,
+            "stream": True,
+            "response_format": {"type": "json_object"},
+        }
+        url = f"{self.settings.llm_base_url.rstrip('/')}/chat/completions"
+        response = requests.post(
+            url,
+            headers=self._headers(),
+            json=payload,
+            timeout=self.settings.llm_timeout_seconds,
+            stream=True,
+        )
+        if response.status_code == 400:
+            payload.pop("response_format", None)
+            response = requests.post(
+                url,
+                headers=self._headers(),
+                json=payload,
+                timeout=self.settings.llm_timeout_seconds,
+                stream=True,
+            )
+        response.raise_for_status()
+        content: list[str] = []
+        for raw_line in response.iter_lines(decode_unicode=True):
+            line = raw_line.decode() if isinstance(raw_line, bytes) else str(raw_line or "")
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if not data or data == "[DONE]":
+                continue
+            chunk = json.loads(data)
+            choices = chunk.get("choices") or []
+            if not choices:
+                continue
+            delta = choices[0].get("delta") or {}
+            reasoning = str(delta.get("reasoning_content") or delta.get("reasoning") or "")
+            if reasoning:
+                on_reasoning(reasoning)
+            text = str(delta.get("content") or "")
+            if text:
+                content.append(text)
+        return _json_object("".join(content).strip())
 
     def completion(
         self,
@@ -140,6 +194,50 @@ class SemanticExtractor:
         if not isinstance(values, list):
             raise ValueError("LLM chunk extraction must contain a zones array")
         return [_zone_payload(value, "") for value in values if isinstance(value, dict)]
+
+    def extract_document_repairs(self, sections: list[dict[str, str]]) -> DocumentRepairExtraction:
+        system = (
+            "Верни только JSON {\"repairs\":[...]}. Тебе переданы исключительно разделы документа "
+            "с заголовком 'Описание ремонта'. Извлеки каждый самостоятельный ремонт или концессию отдельно. "
+            "Repair содержит repair_id, evidence_text, defect_type, section_heading, zones. evidence_text должен "
+            "быть короткой ДОСЛОВНОЙ цитатой из переданного текста, которая одновременно подтверждает ремонт и "
+            "его расположение. Не пересказывай и не исправляй цитату. Если подтверждающей цитаты нет, не создавай "
+            "repair. zones — массив независимых зон этого ремонта. Не объединяй координаты разных утверждений. "
+            "Каждая zone содержит elements,components,structure,system,region,side,surface. Element содержит "
+            "kind,start,end,qualifier,role. Диапазоны включительные. role: target — ремонтируется сам элемент, "
+            "boundary — элемент задает границу 'между', reference — расположение 'у'. Нормализация: "
+            "обшивка=skin, шпангоут=frame, стрингер=stringer, нервюра=rib, закрылок=flap, "
+            "предкрылок=slat, спойлер=spoiler, лонжерон=spar, фланец=flange. structure: wing, fuselage или "
+            "landing_gear; system: NLG/MLG; side: left/right; surface: upper/lower. Заполняй только явно "
+            "указанные сведения. Числа рисунков, листов, Item и количество крепежа не являются координатами."
+        )
+        content = self.client.completion(
+            system,
+            json.dumps({"sections": sections}, ensure_ascii=False),
+            response_format={"type": "json_object"},
+            extra_payload={"chat_template_kwargs": {"enable_thinking": False}},
+        )
+        payload = _json_object(content)
+        raw_repairs = payload.get("repairs")
+        if not isinstance(raw_repairs, list):
+            raise ValueError("LLM document extraction must contain a repairs array")
+        repairs: list[Repair] = []
+        for raw in raw_repairs:
+            if not isinstance(raw, dict) or not str(raw.get("evidence_text") or "").strip():
+                continue
+            raw_zones = raw.get("zones")
+            zones = [
+                _zone_payload(zone, str(raw.get("evidence_text") or ""))
+                for zone in raw_zones if isinstance(zone, dict)
+            ] if isinstance(raw_zones, list) else []
+            repairs.append(Repair(
+                repair_id=str(raw.get("repair_id") or "").strip(),
+                evidence_text=str(raw["evidence_text"]).strip(),
+                defect_type=str(raw.get("defect_type") or "").strip(),
+                section_heading=str(raw.get("section_heading") or "Описание ремонта").strip(),
+                zones=zones,
+            ))
+        return DocumentRepairExtraction(repairs=repairs)
 
 class EmbeddingClient:
     def __init__(self, settings: Settings) -> None:

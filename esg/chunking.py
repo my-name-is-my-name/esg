@@ -22,6 +22,13 @@ class Section:
         return f"{context}\n{self.text}".strip()
 
 
+@dataclass(frozen=True, slots=True)
+class NamedSection:
+    heading: str
+    text: str
+    ordinal: int
+
+
 def parse_markdown(markdown: str, document_id: str, max_chars: int = 12000) -> list[Section]:
     path: list[tuple[int, str]] = []
     current_heading = "Document"
@@ -94,3 +101,33 @@ def split_text(text: str, max_chars: int) -> list[str]:
     if current:
         output.append("\n\n".join(current))
     return output
+
+
+def find_named_sections(markdown: str, expected_title: str) -> list[NamedSection]:
+    """Return complete heading subtrees whose normalized title matches exactly."""
+    lines = markdown.replace("\r\n", "\n").replace("\r", "\n").splitlines()
+    headings: list[tuple[int, int, str]] = []
+    for index, raw_line in enumerate(lines):
+        match = HEADING_RE.match(raw_line.strip())
+        if match:
+            headings.append((index, len(match.group(1)), match.group(2).strip()))
+    expected = normalize_heading(expected_title)
+    result: list[NamedSection] = []
+    for heading_index, (line_index, level, title) in enumerate(headings):
+        if normalize_heading(title) != expected:
+            continue
+        end = len(lines)
+        for next_line, next_level, _ in headings[heading_index + 1 :]:
+            if next_level <= level:
+                end = next_line
+                break
+        text = "\n".join(lines[line_index + 1 : end]).strip()
+        result.append(NamedSection(heading=title, text=text, ordinal=len(result) + 1))
+    return result
+
+
+def normalize_heading(value: str) -> str:
+    cleaned = re.sub(r"<a\b[^>]*>.*?</a>", " ", value, flags=re.IGNORECASE)
+    cleaned = re.sub(r"[*_`]+", "", cleaned)
+    cleaned = re.sub(r"^\s*\d+(?:\.\d+)*[.)]?\s*", "", cleaned)
+    return re.sub(r"\s+", " ", cleaned).strip().casefold()

@@ -93,7 +93,7 @@ class VectorIndex:
 
     def search(
         self, vector: list[float], limit: int, filename_tokens: tuple[str, ...] = (),
-        section_roles: tuple[str, ...] = (),
+        section_roles: tuple[str, ...] = (), record_types: tuple[str, ...] = (),
     ) -> list[tuple[str, float]]:
         from qdrant_client.models import FieldCondition, Filter, MatchAny, MatchValue
 
@@ -101,7 +101,7 @@ class VectorIndex:
         if self.settings.qdrant_collection not in names:
             return []
         query_filter = None
-        if filename_tokens or section_roles:
+        if filename_tokens or section_roles or record_types:
             should = [
                 FieldCondition(key="filename_tokens", match=MatchValue(value=token.casefold()))
                 for token in filename_tokens
@@ -109,6 +109,8 @@ class VectorIndex:
             must = []
             if section_roles:
                 must.append(FieldCondition(key="section_role", match=MatchAny(any=list(section_roles))))
+            if record_types:
+                must.append(FieldCondition(key="record_type", match=MatchAny(any=list(record_types))))
             query_filter = Filter(must=must, should=should)
         if hasattr(self.client, "query_points"):
             result = self.client.query_points(

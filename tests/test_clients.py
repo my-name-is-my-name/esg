@@ -18,8 +18,34 @@ class Response:
     def json(self) -> dict[str, object]:
         return self.payload
 
+    def iter_lines(self, decode_unicode: bool = False):
+        del decode_unicode
+        return iter(self.payload.get("lines", []))
+
 
 class OpenAIClientTests(unittest.TestCase):
+    def test_streaming_json_forwards_reasoning_deltas(self) -> None:
+        settings = mock.Mock(
+            llm_base_url="http://llm/v1",
+            llm_api_key="local",
+            llm_model="model",
+            llm_timeout_seconds=10,
+            llm_max_tokens=4000,
+        )
+        response = Response(200, {"lines": [
+            'data: {"choices":[{"delta":{"reasoning_content":"Проверяю "}}]}',
+            'data: {"choices":[{"delta":{"reasoning_content":"зону."}}]}',
+            'data: {"choices":[{"delta":{"content":"{\\"found\\":false}"}}]}',
+            "data: [DONE]",
+        ]})
+        reasoning: list[str] = []
+
+        with mock.patch("esg.clients.requests.post", return_value=response):
+            payload = OpenAIClient(settings).json_completion_stream("system", "user", reasoning.append)
+
+        self.assertEqual(payload, {"found": False})
+        self.assertEqual(reasoning, ["Проверяю ", "зону."])
+
     def test_embeddings_support_openai_compatible_endpoint(self) -> None:
         settings = mock.Mock(
             ollama_url="http://embeddings/v1",
@@ -124,6 +150,28 @@ class OpenAIClientTests(unittest.TestCase):
         zone = SemanticExtractor(client).extract_chunk_zones([], "text")[0]
 
         self.assertEqual((zone.element("stringer").start, zone.element("stringer").end), (2, 10))
+
+    def test_document_extractor_returns_repairs_with_same_zone_schema(self) -> None:
+        client = mock.Mock()
+        client.completion.return_value = (
+            '{"repairs":[{"repair_id":"AC-1","evidence_text":"Обшивка между нервюрами 1-15.",'
+            '"defect_type":"ремонт","section_heading":"Описание ремонта","zones":[{'
+            '"elements":[{"kind":"rib","start":1,"end":15,"qualifier":"","role":"boundary"}],'
+            '"components":["skin"],"structure":"wing","system":"","region":"",'
+            '"side":"right","surface":"upper"}]}]}'
+        )
+
+        result = SemanticExtractor(client).extract_document_repairs([
+            {"heading": "Описание ремонта", "text": "Обшивка между нервюрами 1-15."}
+        ])
+
+        self.assertEqual(len(result.repairs), 1)
+        self.assertEqual(result.repairs[0].repair_id, "AC-1")
+        self.assertEqual(result.repairs[0].zones[0].element("rib").end, 15)
+        self.assertEqual(
+            client.completion.call_args.kwargs["extra_payload"],
+            {"chat_template_kwargs": {"enable_thinking": False}},
+        )
 
 if __name__ == "__main__":
     unittest.main()

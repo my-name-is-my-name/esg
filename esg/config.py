@@ -78,7 +78,7 @@ class Settings:
     model_id: str = os.getenv("ESG_MODEL_ID", "esg-repair-search")
 
     qdrant_url: str = os.getenv("ESG_QDRANT_URL", "http://127.0.0.1:6333")
-    qdrant_collection: str = os.getenv("ESG_QDRANT_COLLECTION", "esg_document_chunks")
+    qdrant_collection: str = os.getenv("ESG_QDRANT_COLLECTION", "esg_repair_documents_v1")
     ollama_url: str = os.getenv("ESG_OLLAMA_URL", "http://127.0.0.1:11434")
     embedding_api: str = os.getenv("ESG_EMBEDDING_API", "ollama").strip().casefold()
     embedding_model: str = os.getenv("ESG_EMBEDDING_MODEL", "bge-m3")
@@ -96,6 +96,9 @@ class Settings:
     chunk_extraction_enabled: bool = _bool("ESG_CHUNK_EXTRACTION_ENABLED", False)
     chunk_extraction_max_chars: int = int(os.getenv("ESG_CHUNK_EXTRACTION_MAX_CHARS", "5000"))
     chunk_extraction_workers: int = int(os.getenv("ESG_CHUNK_EXTRACTION_WORKERS", "2"))
+    document_extraction_max_chars: int = int(os.getenv("ESG_DOCUMENT_EXTRACTION_MAX_CHARS", "30000"))
+    document_extraction_timeout_seconds: int = int(os.getenv("ESG_DOCUMENT_EXTRACTION_TIMEOUT_SECONDS", "600"))
+    document_extraction_max_tokens: int = int(os.getenv("ESG_DOCUMENT_EXTRACTION_MAX_TOKENS", "8000"))
 
     reranker_url: str = os.getenv("ESG_RERANKER_URL", "")
     reranker_timeout_seconds: int = int(os.getenv("ESG_RERANKER_TIMEOUT_SECONDS", "60"))

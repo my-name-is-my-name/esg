@@ -4,11 +4,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from esg.chunking import parse_markdown
-from esg.ingest import is_chapter_five, sha256_file
+from esg.chunking import find_named_sections, parse_markdown
+from esg.ingest import sha256_file
 from esg.matching import best_zone_match, compare_zones, ranges_compatible
 from esg.models import NumericRange, Zone
-from esg.retrieval import deduplicate_evidence, query_summary
+from esg.retrieval import deduplicate_evidence, match_document_record, query_summary
 from esg.storage import SQLiteStore
 
 
@@ -115,6 +115,28 @@ class MatchingTests(unittest.TestCase):
         self.assertEqual(result.status, "MATCH")
         self.assertEqual(result.zone_index, 2)
 
+    def test_document_record_does_not_mix_zones_from_different_repairs(self) -> None:
+        query = Zone(elements=[
+            {"kind": "rib", "start": 7, "end": 7},
+            {"kind": "stringer", "start": 6, "end": 7},
+        ])
+        row = {
+            "record_id": "record",
+            "evidence_text": "all",
+            "repairs": [
+                {"repair_id": "A", "evidence_text": "rib only", "zones": [{
+                    "elements": [{"kind": "rib", "start": 7, "end": 7}],
+                }]},
+                {"repair_id": "B", "evidence_text": "stringer only", "zones": [{
+                    "elements": [{"kind": "stringer", "start": 6, "end": 7}],
+                }]},
+            ],
+        }
+
+        matched = match_document_record(query, row)
+
+        self.assertEqual(matched["zone_status"], "UNKNOWN")
+
     def test_best_unknown_zone_prefers_most_complete_candidate(self) -> None:
         query = Zone(
             elements=[
@@ -167,15 +189,38 @@ class MatchingTests(unittest.TestCase):
         self.assertIn("стрингеры=4-8", summary)
         self.assertIn("нервюры=1-15", summary)
 
-    def test_chapter_five_is_selected_without_title_hardcode(self) -> None:
-        sections = parse_markdown(
-            "# 5 **Оценка накопленной повреждаемости**\nТекст.\n## **Описание ремонта**\nРемонт.",
-            "doc",
+    def test_repair_description_heading_is_matched_after_normalization(self) -> None:
+        sections = find_named_sections(
+            "# 5 **Оценка**\nТекст.\n## 5.1.1 **Описание ремонта**\nРемонт.\n### Детали\nЗона.",
+            "Описание ремонта",
         )
-        self.assertTrue(all(is_chapter_five(section) for section in sections))
+        self.assertEqual(len(sections), 1)
+        self.assertIn("Ремонт.", sections[0].text)
+        self.assertIn("Зона.", sections[0].text)
 
 
 class StorageTests(unittest.TestCase):
+    def test_registry_lists_canonical_and_duplicate_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteStore(Path(directory) / "test.sqlite3")
+            base = {
+                "root_key": "primary", "physical_relative": "report.docx",
+                "source_name_key": "report.docx", "size": 10, "mtime": 1.0,
+                "canonical_source_path": "new/report.docx", "canonical_document_id": "doc",
+                "reason": "", "markdown_path": "", "repair_section_count": 0,
+                "repair_count": 0, "content_hash": "", "updated_at": "now",
+            }
+            store.replace_registry([
+                {**base, "source_path": "new/report.docx", "is_canonical": 1, "status": "indexed"},
+                {**base, "source_path": "old/report.docx", "is_canonical": 0, "status": "duplicate"},
+            ])
+
+            result = store.document_registry(status="duplicate")
+
+            self.assertEqual(result["total"], 1)
+            self.assertEqual(result["items"][0]["source_path"], "old/report.docx")
+            self.assertEqual(store.document_registry_summary()["statuses"]["indexed"], 1)
+
     def test_replace_search_and_delete_document(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = SQLiteStore(Path(directory) / "test.sqlite3")
@@ -192,7 +237,7 @@ class StorageTests(unittest.TestCase):
             record = {
                 "record_id": "record-1",
                 "document_id": "doc-1",
-                "record_type": "repair_evidence",
+                "record_type": "document_repairs",
                 "section_id": "section-1",
                 "section_heading": "Описание",
                 "heading_path_json": '["Описание"]',

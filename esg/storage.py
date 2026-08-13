@@ -88,6 +88,10 @@ CREATE TABLE IF NOT EXISTS jobs (
     started_at TEXT NOT NULL,
     finished_at TEXT
 );
+CREATE TABLE IF NOT EXISTS metadata (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS source_inventory (
     source_path TEXT PRIMARY KEY,
     root_key TEXT NOT NULL,
@@ -109,6 +113,26 @@ CREATE TABLE IF NOT EXISTS source_sync_state (
     duplicates INTEGER NOT NULL DEFAULT 0,
     error TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS document_registry (
+    source_path TEXT PRIMARY KEY,
+    root_key TEXT NOT NULL,
+    physical_relative TEXT NOT NULL,
+    source_name_key TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    mtime REAL NOT NULL,
+    canonical_source_path TEXT NOT NULL,
+    canonical_document_id TEXT NOT NULL,
+    is_canonical INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    markdown_path TEXT NOT NULL DEFAULT '',
+    repair_section_count INTEGER NOT NULL DEFAULT 0,
+    repair_count INTEGER NOT NULL DEFAULT 0,
+    content_hash TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_document_registry_status
+ON document_registry(status);
 """
 
 
@@ -130,6 +154,8 @@ class SQLiteStore:
                 "surface": "TEXT NOT NULL DEFAULT ''",
                 "components_json": "TEXT NOT NULL DEFAULT '[]'",
                 "elements_json": "TEXT NOT NULL DEFAULT '[]'",
+                "repairs_json": "TEXT NOT NULL DEFAULT '[]'",
+                "zones_json": "TEXT NOT NULL DEFAULT '[]'",
             }
             for name, declaration in migrations.items():
                 if name not in columns:
@@ -144,6 +170,20 @@ class SQLiteStore:
                 "UPDATE records SET filename_token_key = ? WHERE record_id = ?",
                 [(_token_key(str(row["source_path"])), str(row["record_id"])) for row in missing],
             )
+            lexical_version = connection.execute(
+                "SELECT value FROM metadata WHERE key = 'lexical_index_version'"
+            ).fetchone()
+            if not lexical_version or lexical_version["value"] != "3":
+                rows = connection.execute("SELECT record_id, search_text FROM records").fetchall()
+                connection.execute("DELETE FROM records_fts")
+                connection.executemany(
+                    "INSERT INTO records_fts(record_id, search_text) VALUES (?, ?)",
+                    [(row["record_id"], str(row["search_text"])) for row in rows],
+                )
+                connection.execute(
+                    """INSERT INTO metadata(key, value) VALUES ('lexical_index_version', '3')
+                    ON CONFLICT(key) DO UPDATE SET value=excluded.value"""
+                )
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -270,6 +310,77 @@ class SQLiteStore:
                 ).fetchall()
         return [dict(row) for row in rows]
 
+    def registry_items(self) -> list[dict[str, object]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM document_registry ORDER BY source_path COLLATE NOCASE"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def registry_item(self, source_path: str) -> dict[str, object] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM document_registry WHERE source_path = ?", (source_path,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def replace_registry(self, rows: list[dict[str, object]]) -> None:
+        with self.connect() as connection:
+            connection.execute("DELETE FROM document_registry")
+            connection.executemany(
+                """INSERT INTO document_registry (
+                source_path, root_key, physical_relative, source_name_key, size, mtime,
+                canonical_source_path, canonical_document_id, is_canonical, status, reason,
+                markdown_path, repair_section_count, repair_count, content_hash, updated_at
+                ) VALUES (
+                :source_path, :root_key, :physical_relative, :source_name_key, :size, :mtime,
+                :canonical_source_path, :canonical_document_id, :is_canonical, :status, :reason,
+                :markdown_path, :repair_section_count, :repair_count, :content_hash, :updated_at
+                )""",
+                rows,
+            )
+
+    def update_registry(self, source_path: str, **values: object) -> None:
+        allowed = {
+            "status", "reason", "markdown_path", "repair_section_count", "repair_count",
+            "content_hash", "updated_at",
+        }
+        updates = {key: value for key, value in values.items() if key in allowed}
+        if not updates:
+            return
+        assignments = ", ".join(f"{key} = ?" for key in updates)
+        with self.connect() as connection:
+            connection.execute(
+                f"UPDATE document_registry SET {assignments} WHERE source_path = ?",
+                [*updates.values(), source_path],
+            )
+
+    def document_registry(
+        self, status: str = "", limit: int = 100, offset: int = 0
+    ) -> dict[str, object]:
+        where = "WHERE status = ?" if status else ""
+        parameters: list[object] = [status] if status else []
+        with self.connect() as connection:
+            total = int(connection.execute(
+                f"SELECT count(*) FROM document_registry {where}", parameters
+            ).fetchone()[0])
+            rows = connection.execute(
+                f"SELECT * FROM document_registry {where} ORDER BY source_path COLLATE NOCASE LIMIT ? OFFSET ?",
+                [*parameters, max(1, min(limit, 5000)), max(0, offset)],
+            ).fetchall()
+        return {"total": total, "limit": limit, "offset": offset, "items": [dict(row) for row in rows]}
+
+    def document_registry_summary(self) -> dict[str, object]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT status, count(*) AS count FROM document_registry GROUP BY status ORDER BY status"
+            ).fetchall()
+            repairs = int(connection.execute(
+                "SELECT coalesce(sum(repair_count), 0) FROM document_registry WHERE is_canonical = 1"
+            ).fetchone()[0])
+        counts = {str(row["status"]): int(row["count"]) for row in rows}
+        return {"total": sum(counts.values()), "repairs": repairs, "statuses": counts}
+
     def replace_document(self, document: dict[str, object], records: list[dict[str, object]]) -> None:
         with self.connect() as connection:
             document_item = dict(document)
@@ -295,20 +406,20 @@ class SQLiteStore:
                     frame_start, frame_end, stringer_start, stringer_end, component,
                     side, zone_text, evidence_text, search_text, extraction_status, source_path,
                     filename_token_key, structure, system, region, surface,
-                    components_json, elements_json
+                    components_json, elements_json, repairs_json, zones_json
                     ) VALUES (
                     :record_id, :document_id, :record_type, :section_id, :section_heading,
                     :heading_path_json, :section_role, :defect_type, :repair_description,
                     :frame_start, :frame_end, :stringer_start, :stringer_end, :component,
                     :side, :zone_text, :evidence_text, :search_text, :extraction_status, :source_path,
                     :filename_token_key, :structure, :system, :region, :surface,
-                    :components_json, :elements_json
+                    :components_json, :elements_json, :repairs_json, :zones_json
                     )""",
                     item,
                 )
                 connection.execute(
                     "INSERT INTO records_fts(record_id, search_text) VALUES (?, ?)",
-                    (item["record_id"], item["search_text"]),
+                    (item["record_id"], str(item["search_text"])),
                 )
                 connection.executemany(
                     """INSERT INTO record_elements(record_id, ordinal, kind, start, end, qualifier, role)
@@ -374,7 +485,7 @@ class SQLiteStore:
 
     def lexical_search(
         self, query: str, limit: int, filename_tokens: tuple[str, ...] = (),
-        section_roles: tuple[str, ...] = (),
+        section_roles: tuple[str, ...] = (), record_types: tuple[str, ...] = (),
     ) -> list[dict[str, object]]:
         expression = _fts_expression(query)
         if not expression:
@@ -391,12 +502,24 @@ class SQLiteStore:
                 placeholders = ",".join("?" for _ in section_roles)
                 role_filter = f" AND records.section_role IN ({placeholders})"
                 parameters.extend(section_roles)
+            type_filter = ""
+            if record_types:
+                placeholders = ",".join("?" for _ in record_types)
+                type_filter = f" AND records.record_type IN ({placeholders})"
+                parameters.extend(record_types)
             parameters.append(limit)
             rows = connection.execute(
                 """SELECT records.*, bm25(records_fts) AS lexical_rank
                 FROM records_fts JOIN records USING(record_id)
-                WHERE records_fts MATCH ?""" + token_filters + role_filter + " ORDER BY lexical_rank LIMIT ?",
+                WHERE records_fts MATCH ?""" + token_filters + role_filter + type_filter + " ORDER BY lexical_rank LIMIT ?",
                 parameters,
+            ).fetchall()
+        return [_decode_record(row) for row in rows]
+
+    def repair_document_records(self) -> list[dict[str, object]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM records WHERE record_type = 'document_repairs'"
             ).fetchall()
         return [_decode_record(row) for row in rows]
 
@@ -482,11 +605,24 @@ class SQLiteStore:
         payload.update({"job_id": row["job_id"], "status": row["status"], "started_at": row["started_at"], "finished_at": row["finished_at"]})
         return payload
 
+    def interrupt_running_jobs(self) -> None:
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT job_id, payload_json FROM jobs WHERE status IN ('running', 'cancelling')"
+            ).fetchall()
+            for row in rows:
+                payload = json.loads(str(row["payload_json"]))
+                payload["phase"] = "interrupted"
+                connection.execute(
+                    "UPDATE jobs SET status = 'interrupted', payload_json = ?, finished_at = ? WHERE job_id = ?",
+                    (json.dumps(payload, ensure_ascii=False), _sqlite_now(), row["job_id"]),
+                )
+
     def counts(self) -> dict[str, int]:
         with self.connect() as connection:
             documents = connection.execute("SELECT count(*) FROM documents").fetchone()[0]
             records = connection.execute("SELECT count(*) FROM records").fetchone()[0]
-            repairs = connection.execute("SELECT count(*) FROM records WHERE record_type='repair_evidence'").fetchone()[0]
+            repairs = connection.execute("SELECT count(*) FROM records WHERE record_type='document_repairs'").fetchone()[0]
             failed = connection.execute("SELECT count(*) FROM records WHERE extraction_status='extraction_failed'").fetchone()[0]
             elements = connection.execute("SELECT count(*) FROM record_elements").fetchone()[0]
             aliases = connection.execute("SELECT count(*) FROM document_aliases").fetchone()[0]
@@ -515,6 +651,8 @@ def _decode_record(row: sqlite3.Row) -> dict[str, object]:
     item["filename_tokens"] = [token for token in str(item["filename_token_key"]).split("|") if token]
     item["components"] = json.loads(str(item.get("components_json") or "[]"))
     item["elements"] = json.loads(str(item.get("elements_json") or "[]"))
+    item["repairs"] = json.loads(str(item.get("repairs_json") or "[]"))
+    item["zones"] = json.loads(str(item.get("zones_json") or "[]"))
     return item
 
 
@@ -524,10 +662,14 @@ def _record_defaults(record: dict[str, object]) -> dict[str, object]:
         item.setdefault(name, "")
     components = list(item.get("components") or [])
     elements = list(item.get("elements") or [])
+    repairs = list(item.get("repairs") or [])
+    zones = list(item.get("zones") or [])
     item["components"] = components
     item["elements"] = elements
     item["components_json"] = json.dumps(components, ensure_ascii=False)
     item["elements_json"] = json.dumps(elements, ensure_ascii=False)
+    item["repairs_json"] = json.dumps(repairs, ensure_ascii=False)
+    item["zones_json"] = json.dumps(zones, ensure_ascii=False)
     return item
 
 

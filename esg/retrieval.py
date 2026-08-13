@@ -42,6 +42,7 @@ class RetrievalService:
         self,
         question: str,
         progress: Callable[[str], None] | None = None,
+        reasoning_progress: Callable[[str], None] | None = None,
     ) -> dict[str, object]:
         warnings: list[str] = []
         reasoning: list[str] = []
@@ -68,18 +69,21 @@ class RetrievalService:
         if self.settings.search_filename_tokens:
             profile = ", ".join(token.upper() for token in self.settings.search_filename_tokens)
             note(f"Ограничиваю поиск документами профиля: {profile}.")
+        retrieval_query = question
         lexical = self.store.lexical_search(
-            question,
+            retrieval_query,
             self.settings.retrieval_top_k,
             self.settings.search_filename_tokens,
+            record_types=("document_repairs",),
         )
         vector_rows: list[tuple[str, float]] = []
         try:
-            query_vector = self.embeddings.embed([question])[0]
+            query_vector = self.embeddings.embed([retrieval_query])[0]
             vector_rows = self.vector_index.search(
                 query_vector,
                 self.settings.retrieval_top_k,
                 self.settings.search_filename_tokens,
+                record_types=("document_repairs",),
             )
         except Exception as exc:
             warnings.append(f"vector_search_unavailable: {exc!r}")
@@ -90,70 +94,40 @@ class RetrievalService:
             f"векторных: {len(vector_rows)}."
         )
         candidates = self._fuse(lexical, vector_rows)
+        hybrid_ids = {str(row["record_id"]) for row in candidates}
+        structured_matches: list[dict[str, object]] = []
+        compatible: list[dict[str, object]] = []
+        counts = {"MATCH": 0, "UNKNOWN": 0, "CONFLICT": 0}
+        for row in self.store.repair_document_records():
+            annotated = match_document_record(query.zone, row)
+            counts[str(annotated["zone_status"])] += 1
+            if annotated["zone_status"] == "MATCH":
+                structured_matches.append(annotated)
+            elif annotated["zone_status"] == "UNKNOWN" and str(row["record_id"]) in hybrid_ids:
+                compatible.append(annotated)
+        by_id = {str(row["record_id"]): row for row in [*structured_matches, *compatible]}
+        for row in candidates:
+            record_id = str(row["record_id"])
+            annotated = by_id.get(record_id)
+            if annotated:
+                annotated["retrieval_score"] = row.get("retrieval_score", 0.0)
+                annotated["vector_score"] = row.get("vector_score")
+        candidates = list(by_id.values())
+        note(
+            "Проверена сохраненная структура зон: "
+            f"совпадений {counts['MATCH']}, неполных {counts['UNKNOWN']}, "
+            f"исключено конфликтов {counts['CONFLICT']}."
+        )
+        intersections = list(dict.fromkeys(
+            detail
+            for row in structured_matches
+            for detail in list(row.get("zone_details") or [])
+        ))
+        if intersections:
+            note("Подтвержденные пересечения: " + "; ".join(intersections[:8]) + ".")
         if self.reranker.enabled and candidates:
             note("Переранжирую кандидатов локальной cross-encoder моделью.")
         candidates = self._rerank(question, candidates, warnings)
-
-        if (
-            self.settings.query_extraction_enabled
-            and self.settings.chunk_extraction_enabled
-            and self.extractor.client.enabled
-            and candidates
-        ):
-            note(f"Извлекаю конструктивные зоны из найденных чанков маленькой локальной моделью: {len(candidates)}.")
-            extracted, incomplete, cache_hits, model_calls, extraction_errors = self._extract_candidate_zones(candidates)
-            compatible: list[dict[str, object]] = []
-            counts = {"MATCH": 0, "UNKNOWN": 0, "CONFLICT": 0}
-            parsed_candidates = 0
-            parsed_zones = 0
-            for row, zones, is_incomplete in zip(candidates, extracted, incomplete, strict=True):
-                if zones:
-                    parsed_candidates += 1
-                    parsed_zones += len(zones)
-                match = best_zone_match(query.zone, zones)
-                if is_incomplete and match.status != "MATCH":
-                    match = ZoneMatch(
-                        "UNKNOWN",
-                        [*match.details, "часть текста не разобрана"],
-                        match.zone_index,
-                    )
-                row["zone_status"] = match.status
-                row["zone_details"] = match.details
-                if match.zone_index >= 0:
-                    row["matched_zone"] = zones[match.zone_index].model_dump()
-                counts[match.status] += 1
-                if match.status != "CONFLICT":
-                    compatible.append(row)
-            candidates = compatible
-            note(
-                f"Извлечено зон: {parsed_zones} из {parsed_candidates} чанков; "
-                f"обращений к модели: {model_calls}, результатов из кеша: {cache_hits}."
-            )
-            if extraction_errors:
-                warnings.extend(extraction_errors)
-                note(f"Не удалось разобрать частей чанков: {len(extraction_errors)}; они оставлены с неопределенной зоной.")
-            note(
-                "Проверена совместимость зон: "
-                f"совпадений {counts['MATCH']}, неполных {counts['UNKNOWN']}, "
-                f"исключено конфликтов {counts['CONFLICT']}."
-            )
-            intersections = list(dict.fromkeys(
-                detail
-                for row in candidates if row.get("zone_status") == "MATCH"
-                for detail in list(row.get("zone_details") or [])
-            ))
-            if intersections:
-                note("Подтверждённые пересечения: " + "; ".join(intersections[:8]) + ".")
-        else:
-            for row in candidates:
-                row["zone_status"] = "UNKNOWN"
-                row["zone_details"] = []
-            if not self.settings.query_extraction_enabled:
-                note("Структурный разбор отключён; совместимость проверит финальная модель по тексту.")
-            elif not self.settings.chunk_extraction_enabled:
-                note("Разбор зон найденных чанков отключён; совместимость проверит финальная модель по тексту.")
-            elif not self.extractor.client.enabled:
-                note("Малая модель недоступна; совместимость проверит финальная модель по тексту.")
         candidates = self._score(candidates)
         before_deduplication = len(candidates)
         candidates = deduplicate_evidence(candidates)
@@ -164,7 +138,9 @@ class RetrievalService:
         note(f"Отобрано источников для проверки ответа: {len(candidates)}.")
         sources = [source_from_record(row) for row in candidates]
         note("Формирую ответ только по подтверждающим фрагментам документов.")
-        answer, supporting, found = self._answer(question, query, sources, warnings)
+        answer, supporting, found = self._answer(
+            question, query, sources, warnings, reasoning_progress
+        )
         if self.settings.show_retrieved_chunks:
             note(f"Тестовый режим: показываю отобранные retrieval-чанки: {len(sources)}.")
         elif not found:
@@ -306,6 +282,7 @@ class RetrievalService:
         query: QueryExtraction,
         sources: list[SearchSource],
         warnings: list[str],
+        reasoning_progress: Callable[[str], None] | None = None,
     ) -> tuple[str, list[int], bool]:
         if not sources:
             return NEGATIVE_ANSWER, [], False
@@ -349,7 +326,12 @@ class RetrievalService:
             "schema": AnswerDecision.model_json_schema(),
         }
         try:
-            decision = AnswerDecision.model_validate(self.llm.json_completion(system, json.dumps(payload, ensure_ascii=False)))
+            request = json.dumps(payload, ensure_ascii=False)
+            if reasoning_progress:
+                response = self.llm.json_completion_stream(system, request, reasoning_progress)
+            else:
+                response = self.llm.json_completion(system, request)
+            decision = AnswerDecision.model_validate(response)
             if not decision.found:
                 return NEGATIVE_ANSWER, [], False
             return decision.answer, decision.supporting_source_indexes, True
@@ -390,6 +372,36 @@ def source_from_record(row: dict[str, object]) -> SearchSource:
         final_score=float(row.get("final_score") or 0.0),
         extraction_status=str(row.get("extraction_status") or "ok"),
     )
+
+
+def match_document_record(query: Zone, row: dict[str, object]) -> dict[str, object]:
+    item = dict(row)
+    choices: list[tuple[ZoneMatch, Zone, dict[str, object]]] = []
+    for repair in list(row.get("repairs") or []):
+        if not isinstance(repair, dict):
+            continue
+        zones = [Zone.model_validate(zone) for zone in list(repair.get("zones") or [])]
+        match = best_zone_match(query, zones)
+        if match.zone_index >= 0:
+            choices.append((match, zones[match.zone_index], repair))
+        elif zones:
+            choices.append((match, zones[0], repair))
+    if not choices:
+        zones = [Zone.model_validate(zone) for zone in list(row.get("zones") or [])]
+        match = best_zone_match(query, zones)
+        zone = zones[match.zone_index] if match.zone_index >= 0 else (zones[0] if zones else Zone())
+        choices.append((match, zone, {}))
+    rank = {"MATCH": 0, "UNKNOWN": 1, "CONFLICT": 2}
+    match, zone, repair = min(choices, key=lambda value: rank[value[0].status])
+    item["zone_status"] = match.status
+    item["zone_details"] = match.details
+    item["matched_zone"] = zone.model_dump()
+    if repair:
+        item["evidence_text"] = str(repair.get("evidence_text") or item.get("evidence_text") or "")
+        item["repair_description"] = str(repair.get("repair_id") or "")
+        item["defect_type"] = str(repair.get("defect_type") or "")
+        item["section_heading"] = str(repair.get("section_heading") or item.get("section_heading") or "")
+    return item
 
 
 def zone_from_record(row: dict[str, object]) -> Zone:

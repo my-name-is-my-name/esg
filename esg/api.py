@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import io
 import json
 import re
 import time
@@ -10,6 +12,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import PurePosixPath, PureWindowsPath
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 from esg.clients import EmbeddingClient, ExternalReranker, OpenAIClient, SemanticExtractor
 from esg.config import Settings
@@ -24,6 +27,7 @@ class Application:
         self.settings = settings or Settings()
         self.settings.ensure_dirs()
         self.store = SQLiteStore(self.settings.db_path)
+        self.store.interrupt_running_jobs()
         self.llm = OpenAIClient(self.settings)
         query_llm = OpenAIClient(
             replace(
@@ -38,8 +42,15 @@ class Application:
         embeddings = EmbeddingClient(self.settings)
         vector_index = VectorIndex(self.settings)
         self.vector_index = vector_index
-        vector_index.sync_filename_tokens(self.store.filename_token_groups())
-        self.ingestion = IngestionService(self.settings, self.store, embeddings, vector_index)
+        document_llm = OpenAIClient(replace(
+            self.settings,
+            llm_timeout_seconds=self.settings.document_extraction_timeout_seconds,
+            llm_max_tokens=self.settings.document_extraction_max_tokens,
+        ))
+        document_extractor = SemanticExtractor(document_llm)
+        self.ingestion = IngestionService(
+            self.settings, self.store, embeddings, vector_index, document_extractor
+        )
         self.retrieval = RetrievalService(
             self.settings,
             self.store,
@@ -74,7 +85,9 @@ def handler_for(app: Application) -> type[BaseHTTPRequestHandler]:
             self.end_headers()
 
         def do_GET(self) -> None:
-            path = self.path.split("?", 1)[0]
+            parsed = urlsplit(self.path)
+            path = parsed.path
+            query = parse_qs(parsed.query)
             if path == "/api/health":
                 self._json(HTTPStatus.OK, app.health())
                 return
@@ -85,6 +98,20 @@ def handler_for(app: Application) -> type[BaseHTTPRequestHandler]:
                 return
             if path == "/api/sources/status":
                 self._json(HTTPStatus.OK, app.ingestion.source_status())
+                return
+            if path == "/api/documents/summary":
+                self._json(HTTPStatus.OK, app.store.document_registry_summary())
+                return
+            if path == "/api/documents":
+                result = app.store.document_registry(
+                    status=str((query.get("status") or [""])[0]),
+                    limit=_query_int(query, "limit", 100),
+                    offset=_query_int(query, "offset", 0),
+                )
+                self._json(HTTPStatus.OK, result)
+                return
+            if path == "/api/documents.csv":
+                self._csv(app.store.registry_items())
                 return
             if path == "/v1/models":
                 self._json(
@@ -110,6 +137,10 @@ def handler_for(app: Application) -> type[BaseHTTPRequestHandler]:
                         force=bool(payload.get("force", False)),
                         refresh_sources=True,
                     )
+                    self._json(HTTPStatus.ACCEPTED if result.get("accepted") else HTTPStatus.CONFLICT, result)
+                    return
+                if path == "/api/ingest/cancel":
+                    result = app.ingestion.cancel()
                     self._json(HTTPStatus.ACCEPTED if result.get("accepted") else HTTPStatus.CONFLICT, result)
                     return
                 if path == "/v1/chat/completions":
@@ -142,7 +173,7 @@ def handler_for(app: Application) -> type[BaseHTTPRequestHandler]:
                 self.send_header("Cache-Control", "no-cache")
                 self._cors_headers()
                 self.end_headers()
-                def emit_reasoning(message: str) -> None:
+                def emit_reasoning(message: str, newline: bool = True) -> None:
                     chunk = {
                         "id": completion_id,
                         "object": "chat.completion.chunk",
@@ -150,14 +181,21 @@ def handler_for(app: Application) -> type[BaseHTTPRequestHandler]:
                         "model": model,
                         "choices": [{
                             "index": 0,
-                            "delta": {"role": "assistant", "reasoning_content": message + "\n"},
+                            "delta": {
+                                "role": "assistant",
+                                "reasoning_content": message + ("\n" if newline else ""),
+                            },
                             "finish_reason": None,
                         }],
                     }
                     self.wfile.write(("data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n").encode())
                     self.wfile.flush()
 
-                result = app.retrieval.chat(question, progress=emit_reasoning)
+                result = app.retrieval.chat(
+                    question,
+                    progress=emit_reasoning,
+                    reasoning_progress=lambda delta: emit_reasoning(delta, newline=False),
+                )
                 content = append_sources(
                     str(result["answer"]),
                     list(result.get("sources") or []),
@@ -220,6 +258,24 @@ def handler_for(app: Application) -> type[BaseHTTPRequestHandler]:
             self.end_headers()
             self.wfile.write(body)
 
+        def _csv(self, rows: list[dict[str, object]]) -> None:
+            fields = [
+                "source_path", "status", "reason", "is_canonical", "canonical_source_path",
+                "size", "mtime", "markdown_path", "repair_section_count", "repair_count", "updated_at",
+            ]
+            output = io.StringIO()
+            writer = csv.DictWriter(output, fieldnames=fields, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(rows)
+            body = ("\ufeff" + output.getvalue()).encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/csv; charset=utf-8")
+            self.send_header("Content-Disposition", 'attachment; filename="esg-documents.csv"')
+            self.send_header("Content-Length", str(len(body)))
+            self._cors_headers()
+            self.end_headers()
+            self.wfile.write(body)
+
         def _cors_headers(self) -> None:
             self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
@@ -229,6 +285,13 @@ def handler_for(app: Application) -> type[BaseHTTPRequestHandler]:
             print(f"{self.address_string()} - {format % args}")
 
     return Handler
+
+
+def _query_int(query: dict[str, list[str]], name: str, default: int) -> int:
+    try:
+        return int((query.get(name) or [str(default)])[0])
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer") from exc
 
 
 def append_sources(

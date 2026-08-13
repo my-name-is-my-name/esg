@@ -104,6 +104,22 @@ class QueryExtraction(BaseModel):
     zone: Zone = Field(default_factory=Zone)
 
 
+class Repair(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    repair_id: str = ""
+    evidence_text: str = Field(min_length=1)
+    defect_type: str = ""
+    section_heading: str = "Описание ремонта"
+    zones: list[Zone] = Field(default_factory=list)
+
+
+class DocumentRepairExtraction(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    repairs: list[Repair] = Field(default_factory=list)
+
+
 class AnswerDecision(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

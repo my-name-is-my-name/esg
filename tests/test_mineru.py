@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -9,6 +10,19 @@ from esg.mineru import MinerUConverter
 
 
 class MinerUOutputTests(unittest.TestCase):
+    def test_docx_conversion_never_falls_back_to_mineru(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "broken.docx"
+            source.write_bytes(b"not a docx")
+            settings = SimpleNamespace(
+                markdown_dir=root / "markdown",
+                direct_docx_enabled=True,
+            )
+
+            with self.assertRaises(zipfile.BadZipFile):
+                MinerUConverter(settings).convert(source, "doc", "broken.docx")
+
     def test_converted_markdown_preserves_relative_source_path(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             settings = SimpleNamespace(markdown_dir=Path(directory))

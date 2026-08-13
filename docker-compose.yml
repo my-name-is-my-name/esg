@@ -3,7 +3,7 @@ services:
     build: .
     environment:
       ESG_QDRANT_URL: http://qdrant:6333
-      ESG_QDRANT_COLLECTION: ${ESG_QDRANT_COLLECTION:-esg_document_chunks}
+      ESG_QDRANT_COLLECTION: ${ESG_QDRANT_COLLECTION:-esg_repair_documents_v1}
       ESG_OLLAMA_URL: ${ESG_OLLAMA_URL:-http://ollama:11434}
       ESG_EMBEDDING_API: ${ESG_EMBEDDING_API:-ollama}
       ESG_INPUT_DIR: /app/input_documents
@@ -30,6 +30,9 @@ services:
       ESG_CHUNK_EXTRACTION_ENABLED: ${ESG_CHUNK_EXTRACTION_ENABLED:-false}
       ESG_CHUNK_EXTRACTION_MAX_CHARS: ${ESG_CHUNK_EXTRACTION_MAX_CHARS:-5000}
       ESG_CHUNK_EXTRACTION_WORKERS: ${ESG_CHUNK_EXTRACTION_WORKERS:-2}
+      ESG_DOCUMENT_EXTRACTION_MAX_CHARS: ${ESG_DOCUMENT_EXTRACTION_MAX_CHARS:-30000}
+      ESG_DOCUMENT_EXTRACTION_TIMEOUT_SECONDS: ${ESG_DOCUMENT_EXTRACTION_TIMEOUT_SECONDS:-600}
+      ESG_DOCUMENT_EXTRACTION_MAX_TOKENS: ${ESG_DOCUMENT_EXTRACTION_MAX_TOKENS:-8000}
       ESG_RERANKER_URL: ${ESG_RERANKER_URL:-http://reranker-gpu:9101}
       ESG_RERANKER_TIMEOUT_SECONDS: ${ESG_RERANKER_TIMEOUT_SECONDS:-60}
       ESG_RERANKER_BATCH_SIZE: ${ESG_RERANKER_BATCH_SIZE:-8}
@@ -45,8 +48,18 @@ services:
     ports:
       - "8132:8132"
     volumes:
-      - ${ESG_INPUT_DIR:-./input_documents}:/app/input_documents:ro
-      - ${ESG_ARCHIVE_INPUT_DIR:-./input_documents}:/app/archive_documents:ro
+      - type: bind
+        source: ${ESG_INPUT_DIR:-./input_documents}
+        target: /app/input_documents
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${ESG_ARCHIVE_INPUT_DIR:-./input_documents}
+        target: /app/archive_documents
+        read_only: true
+        bind:
+          create_host_path: false
       - ./source_documents:/app/source_documents
       - ./runtime:/app/runtime
     networks:

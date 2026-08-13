@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
-import zipfile
 from pathlib import Path
-from xml.etree import ElementTree as ET
 
 from esg.config import Settings
 from esg.docx import docx_to_markdown
@@ -30,13 +28,11 @@ class MinerUConverter:
         if reuse_existing and target.is_file():
             return target
         if source.suffix.lower() == ".docx" and getattr(self.settings, "direct_docx_enabled", True):
-            try:
-                markdown = docx_to_markdown(source)
-                if markdown.strip():
-                    target.write_text(markdown, encoding="utf-8")
-                    return target
-            except (OSError, KeyError, ValueError, zipfile.BadZipFile, ET.ParseError):
-                pass
+            markdown = docx_to_markdown(source)
+            if not markdown.strip():
+                raise ValueError("DOCX contains no extractable text")
+            target.write_text(markdown, encoding="utf-8")
+            return target
         if source.suffix.lower() in MARKDOWN_EXTENSIONS:
             if source.resolve() != target.resolve():
                 shutil.copy2(source, target)

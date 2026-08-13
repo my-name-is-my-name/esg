@@ -3,12 +3,14 @@ from __future__ import annotations
 import tempfile
 import unittest
 import os
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from esg.config import Settings, filename_matches, filename_tokens
 from esg.ingest import IngestionService, SourceFile, group_source_files, group_sources, select_canonical
+from esg.models import DocumentRepairExtraction, Repair, Zone
 from esg.storage import SQLiteStore
 
 
@@ -161,6 +163,79 @@ class SourceSelectionTests(unittest.TestCase):
                     service._sources_for_job(refresh_sources=True)
 
             self.assertEqual(len(service._sources_for_job(refresh_sources=False)), 1)
+
+    def test_full_pipeline_indexes_one_document_record_without_writing_source(self) -> None:
+        class Embeddings:
+            @staticmethod
+            def embed(texts):
+                return [[0.1, 0.2] for _ in texts]
+
+        class Vectors:
+            def __init__(self):
+                self.rows = []
+
+            def replace_document(self, document_id, rows):
+                self.rows = rows
+
+            @staticmethod
+            def delete_document(document_id):
+                del document_id
+
+        class Extractor:
+            @staticmethod
+            def extract_document_repairs(sections):
+                del sections
+                return DocumentRepairExtraction(repairs=[Repair(
+                    repair_id="AC-1",
+                    evidence_text="Обшивка между нервюрами 1-15 и стрингерами 2-10.",
+                    zones=[Zone(
+                        components=["skin"], structure="wing",
+                        elements=[
+                            {"kind": "rib", "start": 1, "end": 15, "role": "boundary"},
+                            {"kind": "stringer", "start": 2, "end": 10, "role": "boundary"},
+                        ],
+                    )],
+                )])
+
+        document = """<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>
+<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Описание ремонта</w:t></w:r></w:p>
+<w:p><w:r><w:t>Обшивка между нервюрами 1-15 и стрингерами 2-10.</w:t></w:r></w:p>
+</w:body></w:document>"""
+        styles = """<?xml version="1.0" encoding="UTF-8"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/></w:style>
+</w:styles>"""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_root = root / "input"
+            source_root.mkdir()
+            source = source_root / "report_TR.docx"
+            with zipfile.ZipFile(source, "w") as archive:
+                archive.writestr("word/document.xml", document)
+                archive.writestr("word/styles.xml", styles)
+            before = source.read_bytes()
+            settings = Settings(
+                input_dir=source_root,
+                archive_input_dir=None,
+                markdown_dir=root / "markdown",
+                runtime_dir=root / "runtime",
+                input_extensions=(".docx",),
+                input_filename_tokens=("tr",),
+            )
+            store = SQLiteStore(settings.db_path)
+            vectors = Vectors()
+            service = IngestionService(settings, store, Embeddings(), vectors, Extractor())
+
+            result = service.run(refresh_sources=True)
+
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(source.read_bytes(), before)
+            self.assertEqual(store.document_registry_summary()["statuses"]["indexed"], 1)
+            records = store.repair_document_records()
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["repairs"][0]["repair_id"], "AC-1")
+            self.assertEqual(len(vectors.rows), 1)
 
 
 if __name__ == "__main__":
