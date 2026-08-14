@@ -51,23 +51,23 @@ class ApiContractTests(unittest.TestCase):
     def test_source_windows_path_targets_original_docx(self) -> None:
         path = source_windows_path(
             "20240322/02_Внутренние_данные/report TR.docx",
-            "P:/WP013C_RE/ECAR_Stress/Deliverables/01_A320CEO_MSN2947",
+            "P:/Example/Deliverables/Project",
         )
         self.assertEqual(
             path,
-            "P:\\WP013C_RE\\ECAR_Stress\\Deliverables\\01_A320CEO_MSN2947\\"
+            "P:\\Example\\Deliverables\\Project\\"
             "20240322\\02_Внутренние_данные\\report TR.docx",
         )
 
     def test_source_windows_path_uses_prefixed_root_mapping(self) -> None:
         path = source_windows_path(
             "__s7a/folder/report.docx",
-            "P:/WP013C_RE/ECAR_Stress/Deliverables",
-            (("__s7a", "//ru0-archive05/archive/WP_Archives/WP163_S7/ECAR_Stress/Deliverables/02_S7A"),),
+            "P:/Example/Deliverables",
+            (("__s7a", "//fileserver/share/archive"),),
         )
         self.assertEqual(
             path,
-            "\\\\ru0-archive05\\archive\\WP_Archives\\WP163_S7\\ECAR_Stress\\Deliverables\\02_S7A\\folder\\report.docx",
+            "\\\\fileserver\\share\\archive\\folder\\report.docx",
         )
 
     def test_source_excerpt_is_single_line_and_bounded(self) -> None:

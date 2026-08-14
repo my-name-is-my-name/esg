@@ -12,6 +12,7 @@ from esg.clients import EmbeddingClient, ExternalReranker, OpenAIClient, Semanti
 from esg.config import Settings
 from esg.matching import ZoneMatch, best_zone_match
 from esg.models import AnswerDecision, QueryExtraction, SearchSource, Zone
+from esg.repair_text import append_interval_tokens
 from esg.storage import SQLiteStore
 from esg.vector_index import VectorIndex
 
@@ -69,7 +70,7 @@ class RetrievalService:
         if self.settings.search_filename_tokens:
             profile = ", ".join(token.upper() for token in self.settings.search_filename_tokens)
             note(f"Ограничиваю поиск документами профиля: {profile}.")
-        retrieval_query = question
+        retrieval_query = append_interval_tokens(question)
         lexical = self.store.lexical_search(
             retrieval_query,
             self.settings.retrieval_top_k,
@@ -381,6 +382,8 @@ def match_document_record(query: Zone, row: dict[str, object]) -> dict[str, obje
         if not isinstance(repair, dict):
             continue
         zones = [Zone.model_validate(zone) for zone in list(repair.get("zones") or [])]
+        if not zones and str(repair.get("zone_text") or "").strip():
+            zones = [Zone(zone_text=str(repair["zone_text"]))]
         match = best_zone_match(query, zones)
         if match.zone_index >= 0:
             choices.append((match, zones[match.zone_index], repair))
@@ -401,6 +404,7 @@ def match_document_record(query: Zone, row: dict[str, object]) -> dict[str, obje
         item["repair_description"] = str(repair.get("repair_id") or "")
         item["defect_type"] = str(repair.get("defect_type") or "")
         item["section_heading"] = str(repair.get("section_heading") or item.get("section_heading") or "")
+        item["matched_zone"] = Zone(zone_text=str(repair.get("zone_text") or "")).model_dump()
     return item
 
 

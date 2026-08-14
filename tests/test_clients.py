@@ -151,27 +151,5 @@ class OpenAIClientTests(unittest.TestCase):
 
         self.assertEqual((zone.element("stringer").start, zone.element("stringer").end), (2, 10))
 
-    def test_document_extractor_returns_repairs_with_same_zone_schema(self) -> None:
-        client = mock.Mock()
-        client.completion.return_value = (
-            '{"repairs":[{"repair_id":"AC-1","evidence_text":"Обшивка между нервюрами 1-15.",'
-            '"defect_type":"ремонт","section_heading":"Описание ремонта","zones":[{'
-            '"elements":[{"kind":"rib","start":1,"end":15,"qualifier":"","role":"boundary"}],'
-            '"components":["skin"],"structure":"wing","system":"","region":"",'
-            '"side":"right","surface":"upper"}]}]}'
-        )
-
-        result = SemanticExtractor(client).extract_document_repairs([
-            {"heading": "Описание ремонта", "text": "Обшивка между нервюрами 1-15."}
-        ])
-
-        self.assertEqual(len(result.repairs), 1)
-        self.assertEqual(result.repairs[0].repair_id, "AC-1")
-        self.assertEqual(result.repairs[0].zones[0].element("rib").end, 15)
-        self.assertEqual(
-            client.completion.call_args.kwargs["extra_payload"],
-            {"chat_template_kwargs": {"enable_thinking": False}},
-        )
-
 if __name__ == "__main__":
     unittest.main()

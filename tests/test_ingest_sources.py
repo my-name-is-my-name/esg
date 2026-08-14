@@ -3,14 +3,15 @@ from __future__ import annotations
 import tempfile
 import unittest
 import os
-import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from esg.chunking import NamedSection
 from esg.config import Settings, filename_matches, filename_tokens
-from esg.ingest import IngestionService, SourceFile, group_source_files, group_sources, select_canonical
-from esg.models import DocumentRepairExtraction, Repair, Zone
+from esg.ingest import (
+    IngestionService, SourceFile, group_source_files, group_sources, select_canonical,
+)
 from esg.storage import SQLiteStore
 
 
@@ -128,6 +129,32 @@ class SourceSelectionTests(unittest.TestCase):
             self.assertEqual(len(cached), 1)
             self.assertEqual(cached[0].path, source)
 
+    def test_markdown_only_discovers_local_markdown_as_docx_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            markdown_dir = root / "source_documents"
+            source = markdown_dir / "2024" / "report_TR.docx.md"
+            source.parent.mkdir(parents=True)
+            source.write_text("# Описание ремонта\nОбшивка между стрингерами 1-2.", encoding="utf-8")
+            ignored = markdown_dir / "report_AN.docx.md"
+            ignored.write_text("# Описание ремонта\nignore", encoding="utf-8")
+            settings = Settings(
+                input_dir=root / "readonly",
+                markdown_dir=markdown_dir,
+                runtime_dir=root / "runtime",
+                input_extensions=(".docx",),
+                input_filename_tokens=("tr",),
+                markdown_only_ingestion=True,
+            )
+            service = IngestionService(settings, SQLiteStore(settings.db_path), object(), object())
+
+            discovered = service._sources_for_job(refresh_sources=False)
+
+            self.assertEqual(len(discovered), 1)
+            self.assertEqual(discovered[0].relative, "2024/report_TR.docx")
+            self.assertEqual(discovered[0].physical_relative, "2024/report_TR.docx.md")
+            self.assertEqual(discovered[0].path, source)
+
     def test_changed_source_configuration_requires_manual_refresh(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -164,57 +191,18 @@ class SourceSelectionTests(unittest.TestCase):
 
             self.assertEqual(len(service._sources_for_job(refresh_sources=False)), 1)
 
-    def test_full_pipeline_indexes_one_document_record_without_writing_source(self) -> None:
+    def test_markdown_section_becomes_deterministic_chunk(self) -> None:
         class Embeddings:
             @staticmethod
             def embed(texts):
                 return [[0.1, 0.2] for _ in texts]
 
-        class Vectors:
-            def __init__(self):
-                self.rows = []
-
-            def replace_document(self, document_id, rows):
-                self.rows = rows
-
-            @staticmethod
-            def delete_document(document_id):
-                del document_id
-
-        class Extractor:
-            @staticmethod
-            def extract_document_repairs(sections):
-                del sections
-                return DocumentRepairExtraction(repairs=[Repair(
-                    repair_id="AC-1",
-                    evidence_text="Обшивка между нервюрами 1-15 и стрингерами 2-10.",
-                    zones=[Zone(
-                        components=["skin"], structure="wing",
-                        elements=[
-                            {"kind": "rib", "start": 1, "end": 15, "role": "boundary"},
-                            {"kind": "stringer", "start": 2, "end": 10, "role": "boundary"},
-                        ],
-                    )],
-                )])
-
-        document = """<?xml version="1.0" encoding="UTF-8"?>
-<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>
-<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Описание ремонта</w:t></w:r></w:p>
-<w:p><w:r><w:t>Обшивка между нервюрами 1-15 и стрингерами 2-10.</w:t></w:r></w:p>
-</w:body></w:document>"""
-        styles = """<?xml version="1.0" encoding="UTF-8"?>
-<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
-<w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/></w:style>
-</w:styles>"""
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source_root = root / "input"
             source_root.mkdir()
             source = source_root / "report_TR.docx"
-            with zipfile.ZipFile(source, "w") as archive:
-                archive.writestr("word/document.xml", document)
-                archive.writestr("word/styles.xml", styles)
-            before = source.read_bytes()
+            source.write_bytes(b"source remains untouched")
             settings = Settings(
                 input_dir=source_root,
                 archive_input_dir=None,
@@ -223,19 +211,14 @@ class SourceSelectionTests(unittest.TestCase):
                 input_extensions=(".docx",),
                 input_filename_tokens=("tr",),
             )
-            store = SQLiteStore(settings.db_path)
-            vectors = Vectors()
-            service = IngestionService(settings, store, Embeddings(), vectors, Extractor())
+            service = IngestionService(settings, SQLiteStore(settings.db_path), Embeddings(), object())
+            records = service._chunk_records(source=SourceFile(source, "report_TR.docx"), sections=[
+                NamedSection("Описание ремонта", "Обшивка между нервюрами 1-15 и стрингерами 2-10.", 1)
+            ])
 
-            result = service.run(refresh_sources=True)
-
-            self.assertEqual(result["status"], "completed")
-            self.assertEqual(source.read_bytes(), before)
-            self.assertEqual(store.document_registry_summary()["statuses"]["indexed"], 1)
-            records = store.repair_document_records()
             self.assertEqual(len(records), 1)
-            self.assertEqual(records[0]["repairs"][0]["repair_id"], "AC-1")
-            self.assertEqual(len(vectors.rows), 1)
+            self.assertEqual(records[0]["extraction_status"], "deterministic")
+            self.assertIn("нервюрами 1-15", records[0]["evidence_text"])
 
 
 if __name__ == "__main__":

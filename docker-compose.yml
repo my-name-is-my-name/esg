@@ -12,13 +12,14 @@ services:
       ESG_INPUT_FILENAME_TOKENS: ${ESG_INPUT_FILENAME_TOKENS:-TR,SR}
       ESG_SEARCH_FILENAME_TOKENS: ${ESG_SEARCH_FILENAME_TOKENS:-TR,SR}
       ESG_MARKDOWN_DIR: /app/source_documents
+      ESG_MARKDOWN_ONLY_INGESTION: "true"
       ESG_SOURCE_LINK_ROOT: ${ESG_SOURCE_LINK_ROOT:-}
       ESG_SOURCE_LINK_ROOTS: ${ESG_SOURCE_LINK_ROOTS:-{}}
       ESG_RUNTIME_DIR: /app/runtime
       ESG_MODEL_ID: ${ESG_MODEL_ID:-esg-repair-search}
       ESG_EMBEDDING_MODEL: ${ESG_EMBEDDING_MODEL:-bge-m3}
       ESG_EMBEDDING_BATCH_SIZE: ${ESG_EMBEDDING_BATCH_SIZE:-16}
-      ESG_LLM_BASE_URL: ${ESG_LLM_BASE_URL:-http://10.100.112.71:1234/v1}
+      ESG_LLM_BASE_URL: ${ESG_LLM_BASE_URL:-}
       ESG_LLM_API_KEY: ${ESG_LLM_API_KEY:-local}
       ESG_LLM_MODEL: ${ESG_LLM_MODEL:-}
       ESG_LLM_TIMEOUT_SECONDS: ${ESG_LLM_TIMEOUT_SECONDS:-120}
@@ -30,10 +31,8 @@ services:
       ESG_CHUNK_EXTRACTION_ENABLED: ${ESG_CHUNK_EXTRACTION_ENABLED:-false}
       ESG_CHUNK_EXTRACTION_MAX_CHARS: ${ESG_CHUNK_EXTRACTION_MAX_CHARS:-5000}
       ESG_CHUNK_EXTRACTION_WORKERS: ${ESG_CHUNK_EXTRACTION_WORKERS:-2}
-      ESG_DOCUMENT_EXTRACTION_MAX_CHARS: ${ESG_DOCUMENT_EXTRACTION_MAX_CHARS:-30000}
-      ESG_DOCUMENT_EXTRACTION_TIMEOUT_SECONDS: ${ESG_DOCUMENT_EXTRACTION_TIMEOUT_SECONDS:-600}
-      ESG_DOCUMENT_EXTRACTION_MAX_TOKENS: ${ESG_DOCUMENT_EXTRACTION_MAX_TOKENS:-8000}
-      ESG_RERANKER_URL: ${ESG_RERANKER_URL:-http://reranker-gpu:9101}
+      ESG_REPAIR_CHUNK_MAX_CHARS: ${ESG_REPAIR_CHUNK_MAX_CHARS:-5000}
+      ESG_RERANKER_URL: ${ESG_RERANKER_URL:-}
       ESG_RERANKER_TIMEOUT_SECONDS: ${ESG_RERANKER_TIMEOUT_SECONDS:-60}
       ESG_RERANKER_BATCH_SIZE: ${ESG_RERANKER_BATCH_SIZE:-8}
       ESG_RETRIEVAL_TOP_K: ${ESG_RETRIEVAL_TOP_K:-40}
@@ -48,18 +47,6 @@ services:
     ports:
       - "8132:8132"
     volumes:
-      - type: bind
-        source: ${ESG_INPUT_DIR:-./input_documents}
-        target: /app/input_documents
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ${ESG_ARCHIVE_INPUT_DIR:-./input_documents}
-        target: /app/archive_documents
-        read_only: true
-        bind:
-          create_host_path: false
       - ./source_documents:/app/source_documents
       - ./runtime:/app/runtime
     networks:

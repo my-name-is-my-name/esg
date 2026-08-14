@@ -42,15 +42,7 @@ class Application:
         embeddings = EmbeddingClient(self.settings)
         vector_index = VectorIndex(self.settings)
         self.vector_index = vector_index
-        document_llm = OpenAIClient(replace(
-            self.settings,
-            llm_timeout_seconds=self.settings.document_extraction_timeout_seconds,
-            llm_max_tokens=self.settings.document_extraction_max_tokens,
-        ))
-        document_extractor = SemanticExtractor(document_llm)
-        self.ingestion = IngestionService(
-            self.settings, self.store, embeddings, vector_index, document_extractor
-        )
+        self.ingestion = IngestionService(self.settings, self.store, embeddings, vector_index)
         self.retrieval = RetrievalService(
             self.settings,
             self.store,

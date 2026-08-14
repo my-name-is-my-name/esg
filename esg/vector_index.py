@@ -31,9 +31,17 @@ class VectorIndex:
                 pass
 
     def replace_document(self, document_id: str, rows: list[tuple[dict[str, object], list[float]]]) -> None:
+        self.replace_documents([(document_id, rows)])
+
+    def replace_documents(
+        self,
+        documents: list[tuple[str, list[tuple[dict[str, object], list[float]]]]],
+    ) -> None:
         from qdrant_client.models import PointStruct
 
-        self.delete_document(document_id)
+        document_ids = [document_id for document_id, _ in documents]
+        rows = [row for _, document_rows in documents for row in document_rows]
+        self._delete_documents(document_ids)
         if not rows:
             return
         self.ensure_collection(len(rows[0][1]))
@@ -53,6 +61,22 @@ class VectorIndex:
             for record, vector in rows
         ]
         self.client.upsert(collection_name=self.settings.qdrant_collection, points=points, wait=True)
+
+    def _delete_documents(self, document_ids: list[str]) -> None:
+        if not document_ids:
+            return
+        from qdrant_client.models import FieldCondition, Filter, MatchAny
+
+        names = {item.name for item in self.client.get_collections().collections}
+        if self.settings.qdrant_collection not in names:
+            return
+        self.client.delete(
+            collection_name=self.settings.qdrant_collection,
+            points_selector=Filter(must=[
+                FieldCondition(key="document_id", match=MatchAny(any=document_ids))
+            ]),
+            wait=True,
+        )
 
     def delete_document(self, document_id: str) -> None:
         from qdrant_client.models import FieldCondition, Filter, MatchValue

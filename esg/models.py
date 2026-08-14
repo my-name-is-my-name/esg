@@ -111,13 +111,8 @@ class Repair(BaseModel):
     evidence_text: str = Field(min_length=1)
     defect_type: str = ""
     section_heading: str = "Описание ремонта"
+    zone_text: str = ""
     zones: list[Zone] = Field(default_factory=list)
-
-
-class DocumentRepairExtraction(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    repairs: list[Repair] = Field(default_factory=list)
 
 
 class AnswerDecision(BaseModel):

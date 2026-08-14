@@ -67,6 +67,7 @@ class Settings:
     input_dir: Path = Path(os.getenv("ESG_INPUT_DIR", ROOT / "input_documents"))
     archive_input_dir: Path | None = _optional_path("ESG_ARCHIVE_INPUT_DIR")
     markdown_dir: Path = Path(os.getenv("ESG_MARKDOWN_DIR", ROOT / "source_documents"))
+    markdown_only_ingestion: bool = _bool("ESG_MARKDOWN_ONLY_INGESTION", False)
     source_link_root: str = os.getenv("ESG_SOURCE_LINK_ROOT", "")
     source_link_roots: tuple[tuple[str, str], ...] = _source_link_roots()
     input_extensions: tuple[str, ...] = _extensions("ESG_INPUT_EXTENSIONS", ".docx")
@@ -96,9 +97,7 @@ class Settings:
     chunk_extraction_enabled: bool = _bool("ESG_CHUNK_EXTRACTION_ENABLED", False)
     chunk_extraction_max_chars: int = int(os.getenv("ESG_CHUNK_EXTRACTION_MAX_CHARS", "5000"))
     chunk_extraction_workers: int = int(os.getenv("ESG_CHUNK_EXTRACTION_WORKERS", "2"))
-    document_extraction_max_chars: int = int(os.getenv("ESG_DOCUMENT_EXTRACTION_MAX_CHARS", "30000"))
-    document_extraction_timeout_seconds: int = int(os.getenv("ESG_DOCUMENT_EXTRACTION_TIMEOUT_SECONDS", "600"))
-    document_extraction_max_tokens: int = int(os.getenv("ESG_DOCUMENT_EXTRACTION_MAX_TOKENS", "8000"))
+    repair_chunk_max_chars: int = int(os.getenv("ESG_REPAIR_CHUNK_MAX_CHARS", "5000"))
 
     reranker_url: str = os.getenv("ESG_RERANKER_URL", "")
     reranker_timeout_seconds: int = int(os.getenv("ESG_RERANKER_TIMEOUT_SECONDS", "60"))
@@ -129,7 +128,7 @@ class Settings:
 
     def ensure_dirs(self) -> None:
         inputs = [self.input_dir, *([self.archive_input_dir] if self.archive_input_dir else [])]
-        for input_dir in inputs:
+        for input_dir in (() if self.markdown_only_ingestion else inputs):
             if not input_dir.is_dir():
                 raise RuntimeError(f"ESG input directory does not exist or is not a directory: {input_dir}")
             input_path = input_dir.resolve()

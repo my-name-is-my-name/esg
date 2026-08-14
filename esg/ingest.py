@@ -3,25 +3,24 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 import threading
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from esg.chunking import NamedSection, find_named_sections, split_text
-from esg.clients import EmbeddingClient, SemanticExtractor
+from esg.chunking import NamedSection, find_named_sections
+from esg.clients import EmbeddingClient
 from esg.config import Settings, filename_matches, filename_tokens
-from esg.mineru import MinerUConverter
-from esg.models import Repair, Zone
+from esg.repair_text import append_interval_tokens, repair_section_chunks
 from esg.storage import SQLiteStore
 from esg.vector_index import VectorIndex
 
 
-INDEX_VERSION = 4
+INDEX_VERSION = 7
 REPAIR_HEADING = "Описание ремонта"
-EXTRACTION_PROMPT_VERSION = "document-repairs-v1"
+INDEX_BATCH_DOCUMENTS = 32
+INDEX_BATCH_CHUNKS = 32
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,6 +37,10 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def source_name_key(source: SourceFile) -> str:
+    return Path(source.relative).name.casefold()
+
+
 class IngestionService:
     def __init__(
         self,
@@ -45,14 +48,11 @@ class IngestionService:
         store: SQLiteStore,
         embeddings: EmbeddingClient,
         vector_index: VectorIndex,
-        document_extractor: SemanticExtractor | None = None,
     ) -> None:
         self.settings = settings
         self.store = store
         self.embeddings = embeddings
         self.vector_index = vector_index
-        self.document_extractor = document_extractor
-        self.converter = MinerUConverter(settings)
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._cancel = threading.Event()
@@ -97,87 +97,54 @@ class IngestionService:
             groups = group_source_files(discovered)
             canonical = {name: select_canonical_source(group) for name, group in groups.items()}
             payload.update({
-                "phase": "conversion",
+                "phase": "markdown",
                 "scanned": len(discovered),
                 "canonical": len(groups),
                 "duplicates": len(discovered) - len(groups),
-                "conversion_total": len(groups),
+                "conversion_total": 0,
+                "extraction_total": len(groups),
             })
             self._initialize_registry(discovered, groups, canonical, bool(payload["force"]))
             self.store.upsert_job(job_id, "running", payload, started, None)
 
-            ready: list[tuple[SourceFile, list[SourceFile], str]] = []
+            batch: list[tuple[SourceFile, list[SourceFile], str, list[NamedSection], list[dict[str, object]]]] = []
             for source_name_key in sorted(canonical):
                 if self._cancelled(job_id, started, payload):
                     return
                 selected = canonical[source_name_key]
                 try:
                     registry = self.store.registry_item(selected.relative) or {}
-                    terminal = str(registry.get("status") or "") in {
-                        "indexed", "indexed_zero_repairs", "no_repair_section"
-                    }
-                    markdown_path = Path(str(registry.get("markdown_path") or ""))
-                    if terminal and markdown_path.is_file() and not bool(payload["force"]):
+                    document = self.store.document_state(selected.relative) or {}
+                    status = str(registry.get("status") or "")
+                    terminal = status == "no_repair_section" or (
+                        status in {"indexed", "indexed_zero_repairs"}
+                        and int(document.get("index_version") or 0) == INDEX_VERSION
+                    )
+                    if terminal and not bool(payload["force"]):
                         payload["skipped"] = int(payload["skipped"]) + 1
                         continue
-                    sections, content_hash = self._convert_document(selected, bool(payload["force"]))
-                    payload["converted"] = int(payload["converted"]) + 1
+                    sections, content_hash = self._load_markdown_sections(registry)
                     if sections:
-                        ready.append((selected, groups[source_name_key], content_hash))
+                        records = self._chunk_records(selected, sections)
+                        if records:
+                            batch.append((selected, groups[source_name_key], content_hash, sections, records))
+                            if len(batch) >= INDEX_BATCH_DOCUMENTS or _batch_record_count(batch) >= INDEX_BATCH_CHUNKS:
+                                self._index_batch(batch, payload)
+                                batch = []
+                        else:
+                            self._store_empty_document(
+                                selected, content_hash, "indexed_zero_repairs",
+                                "Раздел «Описание ремонта» не содержит индексируемого текста",
+                            )
+                            self._mark_indexed(selected, groups[source_name_key], 0, "indexed_zero_repairs", payload)
                     else:
                         payload["no_repair_section"] = int(payload["no_repair_section"]) + 1
                         self._store_empty_document(selected, content_hash, "no_repair_section", "Нет раздела «Описание ремонта»")
-                    self._replace_aliases(selected, groups[source_name_key])
-                except Exception as exc:
-                    payload["conversion_failed"] = int(payload["conversion_failed"]) + 1
-                    self.store.update_registry(
-                        selected.relative,
-                        status="conversion_failed",
-                        reason=repr(exc),
-                        updated_at=utc_now(),
-                    )
-                    self._append_error(payload, selected.relative, "conversion", exc)
-                finally:
-                    payload["conversion_processed"] = int(payload["conversion_processed"]) + 1
-                    self.store.upsert_job(job_id, "running", payload, started, None)
-
-            payload["phase"] = "extraction"
-            payload["extraction_total"] = len(ready)
-            self.store.upsert_job(job_id, "running", payload, started, None)
-            for selected, aliases, content_hash in ready:
-                if self._cancelled(job_id, started, payload):
-                    return
-                try:
-                    markdown_path = self.converter.markdown_path(
-                        selected.relative, selected.path.suffix.lower()
-                    )
-                    markdown = markdown_path.read_text(encoding="utf-8", errors="replace")
-                    sections = find_named_sections(markdown, REPAIR_HEADING)
-                    if not sections:
-                        raise RuntimeError("Repair sections disappeared after conversion")
-                    repairs = self._extract_repairs(selected, sections, content_hash, bool(payload["force"]))
-                    if repairs:
-                        self._index_repairs(selected, content_hash, sections, repairs)
-                        status = "indexed"
-                        reason = ""
-                        payload["indexed"] = int(payload["indexed"]) + 1
-                        payload["repairs"] = int(payload["repairs"]) + len(repairs)
-                    else:
-                        self._store_empty_document(
-                            selected, content_hash, "indexed_zero_repairs",
-                            "LLM не обнаружила подтвержденных ремонтов в разделе «Описание ремонта»",
+                        self.store.update_registry(
+                            selected.relative, status="no_repair_section",
+                            reason="Нет раздела «Описание ремонта»", repair_count=0, updated_at=utc_now(),
                         )
-                        status = "indexed_zero_repairs"
-                        reason = "LLM не обнаружила подтвержденных ремонтов"
-                        payload["indexed_zero_repairs"] = int(payload["indexed_zero_repairs"]) + 1
-                    self.store.update_registry(
-                        selected.relative,
-                        status=status,
-                        reason=reason,
-                        repair_count=len(repairs),
-                        updated_at=utc_now(),
-                    )
-                    self._replace_aliases(selected, aliases)
+                    self._replace_aliases(selected, groups[source_name_key])
                 except Exception as exc:
                     payload["extraction_failed"] = int(payload["extraction_failed"]) + 1
                     self.store.update_registry(
@@ -186,9 +153,12 @@ class IngestionService:
                         reason=repr(exc),
                         updated_at=utc_now(),
                     )
-                    self._append_error(payload, selected.relative, "extraction", exc)
-                payload["extraction_processed"] = int(payload["extraction_processed"]) + 1
-                self.store.upsert_job(job_id, "running", payload, started, None)
+                    self._append_error(payload, selected.relative, "markdown", exc)
+                finally:
+                    payload["extraction_processed"] = int(payload["extraction_processed"]) + 1
+                    self.store.upsert_job(job_id, "running", payload, started, None)
+            if batch:
+                self._index_batch(batch, payload)
 
             failures = int(payload["conversion_failed"]) + int(payload["extraction_failed"])
             status = "completed" if failures == 0 else "completed_with_errors"
@@ -226,6 +196,7 @@ class IngestionService:
             "indexed": 0,
             "indexed_zero_repairs": 0,
             "repairs": 0,
+            "chunks": 0,
             "extraction_failed": 0,
             "errors": [],
         }
@@ -241,7 +212,7 @@ class IngestionService:
         rows: list[dict[str, object]] = []
         now = utc_now()
         for source in discovered:
-            selected = canonical[source.path.name.casefold()]
+            selected = canonical[source_name_key(source)]
             is_canonical = source.relative == selected.relative
             old = previous.get(source.relative)
             unchanged = bool(
@@ -263,7 +234,7 @@ class IngestionService:
                 "source_path": source.relative,
                 "root_key": source.root_key,
                 "physical_relative": source.physical_relative,
-                "source_name_key": source.path.name.casefold(),
+                "source_name_key": source_name_key(source),
                 "size": int(source.size or 0),
                 "mtime": float(source.mtime or 0),
                 "canonical_source_path": selected.relative,
@@ -271,7 +242,7 @@ class IngestionService:
                 "is_canonical": int(is_canonical),
                 "status": status,
                 "reason": reason,
-                "markdown_path": str(old.get("markdown_path") or "") if unchanged and old else "",
+                "markdown_path": self._registry_markdown_path(source, old, unchanged),
                 "repair_section_count": int(old.get("repair_section_count") or 0) if unchanged and old else 0,
                 "repair_count": int(old.get("repair_count") or 0) if unchanged and old else 0,
                 "content_hash": str(old.get("content_hash") or "") if unchanged and old else "",
@@ -279,118 +250,88 @@ class IngestionService:
             })
         self.store.replace_registry(rows)
 
-    def _convert_document(self, source: SourceFile, force: bool) -> tuple[list[NamedSection], str]:
-        target = self.converter.markdown_path(source.relative, source.path.suffix.lower())
-        registry = self.store.registry_item(source.relative)
-        reuse = bool(
-            target.is_file()
-            and registry
-            and str(registry.get("status") or "") != "conversion_pending"
-            and not force
-        )
-        content_hash = str(registry.get("content_hash") or "") if registry else ""
-        markdown_path = self.converter.convert(
-            source.path, document_id_for(source.relative), source.relative, reuse_existing=reuse
-        )
-        if not content_hash:
-            content_hash = sha256_file(markdown_path)
+    def _registry_markdown_path(
+        self, source: SourceFile, old: dict[str, object] | None, unchanged: bool
+    ) -> str:
+        if self.settings.markdown_only_ingestion:
+            return str(source.path)
+        if unchanged and old:
+            return str(old.get("markdown_path") or "")
+        return ""
+
+    def _load_markdown_sections(self, registry: dict[str, object]) -> tuple[list[NamedSection], str]:
+        markdown_path = Path(str(registry.get("markdown_path") or ""))
         markdown = markdown_path.read_text(encoding="utf-8", errors="replace")
         sections = find_named_sections(markdown, REPAIR_HEADING)
-        status = "converted" if sections else "no_repair_section"
-        reason = "" if sections else "Нет раздела «Описание ремонта»"
-        self.store.update_registry(
-            source.relative,
-            status=status,
-            reason=reason,
-            markdown_path=str(markdown_path),
-            repair_section_count=len(sections),
-            content_hash=content_hash,
-            updated_at=utc_now(),
-        )
+        content_hash = str(registry.get("content_hash") or "") or sha256_file(markdown_path)
         return sections, content_hash
 
-    def _extract_repairs(
+    def _chunk_records(
         self,
         source: SourceFile,
         sections: list[NamedSection],
-        content_hash: str,
-        force: bool,
-    ) -> list[Repair]:
-        self.store.update_registry(
-            source.relative, status="extraction_pending", reason="", updated_at=utc_now()
-        )
-        parts: list[dict[str, str]] = []
-        for section in sections:
-            text_parts = split_text(section.text, max(1, self.settings.document_extraction_max_chars))
-            parts.extend({"heading": section.heading, "text": part} for part in text_parts if part.strip())
-        source_text = "\n\n".join(section.text for section in sections)
-        repairs: list[Repair] = []
-        for part in parts:
-            cache_key = hashlib.sha256((
-                EXTRACTION_PROMPT_VERSION + "\0" + content_hash + "\0" + part["heading"] + "\0" + part["text"]
-            ).encode("utf-8")).hexdigest()
-            cached = None if force else self.store.cached_extraction(cache_key)
-            if cached and cached.get("status") == "ok":
-                values = (cached.get("payload") or {}).get("repairs", [])
-                extracted = [Repair.model_validate(item) for item in values]
-            else:
-                if self.document_extractor is None:
-                    raise RuntimeError("Document repair extractor is not configured")
-                result = self.document_extractor.extract_document_repairs([part])
-                extracted = result.repairs
-                invalid = [item for item in extracted if not quote_in_source(item.evidence_text, part["text"])]
-                if invalid:
-                    raise ValueError(
-                        f"LLM evidence is not a verbatim fragment of {REPAIR_HEADING}: "
-                        f"{invalid[0].evidence_text[:120]!r}"
-                    )
-                self.store.cache_extraction(
-                    cache_key,
-                    {"repairs": [item.model_dump() for item in extracted]},
-                    "ok",
-                    "",
-                    utc_now(),
-                )
-            for repair in extracted:
-                if not quote_in_source(repair.evidence_text, source_text):
-                    raise ValueError(
-                        f"LLM evidence is not a verbatim fragment of {REPAIR_HEADING}: {repair.evidence_text[:120]!r}"
-                    )
-                repairs.append(repair)
-        return merge_repairs(repairs)
-
-    def _index_repairs(
-        self,
-        source: SourceFile,
-        content_hash: str,
-        sections: list[NamedSection],
-        repairs: list[Repair],
-    ) -> None:
+    ) -> list[dict[str, object]]:
         document_id = document_id_for(source.relative)
-        zones = [zone for repair in repairs for zone in repair.zones]
-        evidence = "\n\n".join(repair.evidence_text for repair in repairs)
-        headings = list(dict.fromkeys(section.heading for section in sections))
-        record = _base_record(
-            record_id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"{document_id}|document-repairs-v1")),
-            document_id=document_id,
-            relative=source.relative,
-            record_type="document_repairs",
-            section_id=f"{document_id}-repair-descriptions",
-            section_heading="; ".join(headings),
-            heading_path=headings,
-            section_role="repair_description",
-            extraction_status="ok",
-            defect_type=", ".join(dict.fromkeys(item.defect_type for item in repairs if item.defect_type)),
-            repair_description=", ".join(dict.fromkeys(item.repair_id for item in repairs if item.repair_id)),
-            evidence_text=evidence,
-            search_text=repair_search_text(repairs),
-            repairs=[item.model_dump() for item in repairs],
-            zones=[item.model_dump() for item in zones],
+        records: list[dict[str, object]] = []
+        for section in sections:
+            chunks = repair_section_chunks(section.text, self.settings.repair_chunk_max_chars)
+            for chunk_index, chunk in enumerate(chunks, start=1):
+                raw_id = f"{document_id}|{section.ordinal}|{chunk_index}|{hashlib.sha256(chunk.encode()).hexdigest()}"
+                records.append(_base_record(
+                    record_id=str(uuid.uuid5(uuid.NAMESPACE_URL, raw_id)),
+                    document_id=document_id,
+                    relative=source.relative,
+                    record_type="document_repairs",
+                    section_id=f"{document_id}-repair-{section.ordinal}-{chunk_index}",
+                    section_heading=section.heading,
+                    heading_path=[section.heading],
+                    section_role="repair_description",
+                    extraction_status="deterministic",
+                    evidence_text=chunk,
+                    search_text=append_interval_tokens(f"{REPAIR_HEADING}\n{chunk}"),
+                    repairs=[],
+                    zones=[],
+                    zone_text=chunk,
+                ))
+        return records
+
+    def _index_batch(
+        self,
+        batch: list[tuple[SourceFile, list[SourceFile], str, list[NamedSection], list[dict[str, object]]]],
+        payload: dict[str, object],
+    ) -> None:
+        records = [record for _, _, _, _, document_records in batch for record in document_records]
+        vectors = self.embeddings.embed([str(record["search_text"]) for record in records])
+        vector_offset = 0
+        vector_documents: list[tuple[str, list[tuple[dict[str, object], list[float]]]]] = []
+        for source, aliases, content_hash, sections, document_records in batch:
+            count = len(document_records)
+            document_vectors = vectors[vector_offset : vector_offset + count]
+            vector_offset += count
+            self.store.replace_document(
+                self._document(source, content_hash, "indexed", ""), document_records
+            )
+            vector_documents.append((
+                document_id_for(source.relative), list(zip(document_records, document_vectors, strict=True))
+            ))
+            self.store.update_registry(
+                source.relative, status="indexed", reason="", repair_count=len(sections), updated_at=utc_now()
+            )
+            self._replace_aliases(source, aliases)
+            payload["indexed"] = int(payload["indexed"]) + 1
+            payload["repairs"] = int(payload["repairs"]) + len(sections)
+            payload["chunks"] = int(payload["chunks"]) + count
+        self.vector_index.replace_documents(vector_documents)
+
+    def _mark_indexed(
+        self, source: SourceFile, aliases: list[SourceFile], repair_count: int,
+        status: str, payload: dict[str, object],
+    ) -> None:
+        self.store.update_registry(
+            source.relative, status=status, reason="", repair_count=repair_count, updated_at=utc_now()
         )
-        vector = self.embeddings.embed([str(record["search_text"])])[0]
-        document = self._document(source, content_hash, "indexed", "")
-        self.store.replace_document(document, [record])
-        self.vector_index.replace_document(document_id, [(record, vector)])
+        self._replace_aliases(source, aliases)
+        payload[status] = int(payload[status]) + 1
 
     def _store_empty_document(self, source: SourceFile, content_hash: str, status: str, reason: str) -> None:
         document_id = document_id_for(source.relative)
@@ -443,7 +384,22 @@ class IngestionService:
 
     def _sources_for_job(self, refresh_sources: bool) -> list[SourceFile]:
         signature = self.source_config_signature()
+        if self.settings.markdown_only_ingestion:
+            if not refresh_sources:
+                inventory = self.store.source_inventory(signature)
+                if inventory is not None:
+                    return self._sources_from_markdown_inventory(inventory)
+            discovered = self._discover_markdown_sources()
+            self.store.replace_source_inventory(
+                [self._inventory_item(source) for source in discovered],
+                signature,
+                utc_now(),
+                utc_now(),
+            )
+            return discovered
         if refresh_sources:
+            if self.settings.markdown_only_ingestion:
+                raise RuntimeError("Source refresh is disabled in Markdown-only ingestion mode")
             started = utc_now()
             try:
                 discovered = self._discover_sources()
@@ -467,16 +423,47 @@ class IngestionService:
             mtime=float(item["mtime"]),
         ) for item in inventory]
 
+    def _sources_from_markdown_inventory(self, inventory: list[dict[str, object]]) -> list[SourceFile]:
+        return [SourceFile(
+            path=self.settings.markdown_dir / str(item["physical_relative"]),
+            relative=str(item["source_path"]),
+            root_key=str(item["root_key"]),
+            physical_relative=str(item["physical_relative"]),
+            size=int(item["size"]),
+            mtime=float(item["mtime"]),
+        ) for item in inventory]
+
     @staticmethod
     def _inventory_item(source: SourceFile) -> dict[str, object]:
         return {
             "source_path": source.relative,
             "root_key": source.root_key,
             "physical_relative": source.physical_relative,
-            "source_name_key": source.path.name.casefold(),
+            "source_name_key": source_name_key(source),
             "size": source.size,
             "mtime": source.mtime,
         }
+
+    def _discover_markdown_sources(self) -> list[SourceFile]:
+        discovered: list[SourceFile] = []
+        root = self.settings.markdown_dir
+        for path in root.rglob("*.docx.md"):
+            if not path.is_file():
+                continue
+            relative_md = path.relative_to(root).as_posix()
+            relative_docx = relative_md[:-3]
+            if not filename_matches(Path(relative_docx).name, self.settings.input_filename_tokens):
+                continue
+            stat = path.stat()
+            discovered.append(SourceFile(
+                path=path,
+                relative=relative_docx,
+                root_key="markdown",
+                physical_relative=relative_md,
+                size=stat.st_size,
+                mtime=stat.st_mtime,
+            ))
+        return sorted(discovered, key=lambda item: item.relative.casefold())
 
     def _discover_sources(self) -> list[SourceFile]:
         discovered: list[SourceFile] = []
@@ -519,7 +506,7 @@ def _base_record(
     section_id: str, section_heading: str, heading_path: list[str], section_role: str,
     extraction_status: str, evidence_text: str, search_text: str, defect_type: str = "",
     repair_description: str = "", repairs: list[dict[str, object]] | None = None,
-    zones: list[dict[str, object]] | None = None,
+    zones: list[dict[str, object]] | None = None, zone_text: str = "",
 ) -> dict[str, object]:
     tokens = filename_tokens(relative)
     return {
@@ -544,7 +531,7 @@ def _base_record(
         "surface": "",
         "components": [],
         "elements": [],
-        "zone_text": "",
+        "zone_text": zone_text,
         "evidence_text": evidence_text,
         "search_text": search_text,
         "extraction_status": extraction_status,
@@ -554,49 +541,6 @@ def _base_record(
         "repairs": repairs or [],
         "zones": zones or [],
     }
-
-
-def repair_search_text(repairs: list[Repair]) -> str:
-    parts: list[str] = []
-    for repair in repairs:
-        parts.extend([repair.repair_id, repair.defect_type, repair.evidence_text])
-        for zone in repair.zones:
-            parts.extend([zone.structure, zone.system, zone.region, zone.side, zone.surface, *zone.components])
-            parts.extend(
-                f"{item.kind} {item.start or ''} {item.end or ''} {item.qualifier} {item.role}"
-                for item in zone.elements
-            )
-    return "\n".join(part for part in parts if part).strip()
-
-
-def merge_repairs(repairs: list[Repair]) -> list[Repair]:
-    merged: dict[str, Repair] = {}
-    for repair in repairs:
-        key = repair.repair_id.casefold() if repair.repair_id else normalize_quote(repair.evidence_text)
-        previous = merged.get(key)
-        if not previous:
-            merged[key] = repair
-            continue
-        seen = {json.dumps(zone.model_dump(), ensure_ascii=False, sort_keys=True) for zone in previous.zones}
-        zones = list(previous.zones)
-        for zone in repair.zones:
-            encoded = json.dumps(zone.model_dump(), ensure_ascii=False, sort_keys=True)
-            if encoded not in seen:
-                seen.add(encoded)
-                zones.append(zone)
-        merged[key] = previous.model_copy(update={"zones": zones})
-    return list(merged.values())
-
-
-def normalize_quote(value: str) -> str:
-    value = re.sub(r"<a\b[^>]*>.*?</a>", " ", value, flags=re.IGNORECASE)
-    value = re.sub(r"[*_`]", "", value)
-    return re.sub(r"\s+", " ", value).strip().casefold()
-
-
-def quote_in_source(quote: str, source: str) -> bool:
-    normalized = normalize_quote(quote)
-    return bool(normalized) and normalized in normalize_quote(source)
 
 
 def document_id_for(relative: str) -> str:
@@ -613,7 +557,7 @@ def group_sources(sources: list[Path]) -> dict[str, list[Path]]:
 def group_source_files(sources: list[SourceFile]) -> dict[str, list[SourceFile]]:
     groups: dict[str, list[SourceFile]] = {}
     for source in sources:
-        groups.setdefault(source.path.name.casefold(), []).append(source)
+        groups.setdefault(source_name_key(source), []).append(source)
     return groups
 
 
@@ -622,6 +566,12 @@ def select_canonical_source(sources: list[SourceFile]) -> SourceFile:
         source.mtime if source.mtime is not None else source.path.stat().st_mtime,
         source.relative.casefold(),
     ))
+
+
+def _batch_record_count(
+    batch: list[tuple[SourceFile, list[SourceFile], str, list[NamedSection], list[dict[str, object]]]]
+) -> int:
+    return sum(len(records) for _, _, _, _, records in batch)
 
 
 def select_canonical(sources: list[Path], root: Path) -> Path:
